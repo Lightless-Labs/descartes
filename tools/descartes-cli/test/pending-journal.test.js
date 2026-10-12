@@ -1,0 +1,325 @@
+// Context plan C1.4 (§6.4, I44, I52-I54, I69, I70, I3; open item 16): the pending journal.
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { createFactIntegrityLedger } from "../src/fact-store-integrity.js";
+import {
+  appendPendingEntries,
+  checkpointPendingJournal,
+  compactionEntriesForCap,
+  emptyPendingState,
+  foldPendingEntries,
+  inspectPendingJournal,
+  journalCommittedPass,
+  journalScoredThrough,
+  MAX_OPEN_PENDING_ITEMS,
+  openPendingJournal,
+  PENDING_JOURNAL_FAMILIES,
+  pendingAdmissionStatus,
+  pendingItemId,
+  pendingMembership,
+  PendingJournalWriteRefused,
+  resolvePendingJournalPaths,
+  unscoredPasses,
+} from "../src/pending-journal.js";
+import { resolveDescartesPaths } from "../src/paths.js";
+
+async function tempPaths() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-pending-journal-test-"));
+  return resolveDescartesPaths({ HOME: root, XDG_CONFIG_HOME: path.join(root, "config"), XDG_DATA_HOME: path.join(root, "data"), XDG_STATE_HOME: path.join(root, "state"), XDG_CACHE_HOME: path.join(root, "cache") });
+}
+
+const FAMILY = "session";
+const HOUR = 60 * 60 * 1000;
+const T0 = Date.UTC(2026, 9, 12, 0, 0);
+function iso(hours) {
+  return new Date(T0 + hours * HOUR).toISOString();
+}
+function ledgerAt(passId, { generation = "gen-a", ageFloorHours = null } = {}) {
+  const ledger = createFactIntegrityLedger();
+  return {
+    ...ledger,
+    generation,
+    age_floor_ts: ageFloorHours === null ? null : iso(ageFloorHours),
+    continuity: { ...ledger.continuity, last_committed_pass_id: passId, continuity_ok: true, pending_pass: null, last_rewrite_newest_ts: iso(passId) },
+  };
+}
+function passResult(passId, written = 3) {
+  return { written_count: written, retention: { pass_id: passId, ledger_generation: "gen-a", pass_time_ms: T0 + passId * HOUR } };
+}
+
+async function scoredTick(paths, passId, options = {}) {
+  const ledger = options.ledger ?? ledgerAt(passId);
+  const { handle, report } = await journalCommittedPass(paths, FAMILY, { passResult: options.passResult ?? passResult(passId), ledger, ts: iso(passId), witnessExists: options.witnessExists ?? false });
+  if (options.score !== false) await journalScoredThrough(paths, handle, { ledger, passId, scored: true, ts: iso(passId) });
+  return { handle, report };
+}
+
+const ITEM = { alert_id: "alert_aaaaaaaaaaaaaaaa", episode: iso(0), incident_key: "lvl:r:4" };
+
+test("journaled families are derived from the declared incumbent rules", () => {
+  assert.deepEqual(PENDING_JOURNAL_FAMILIES, ["peer", "process_lineage", "scheduled_job", "service", "session"]);
+});
+
+test("pending_restamped_each_pass: each structural pass is mapped, scored and checkpointed, with no discontinuity", async () => {
+  const paths = await tempPaths();
+  for (let pass = 1; pass <= 3; pass += 1) {
+    const { report } = await scoredTick(paths, pass);
+    assert.equal(report.discontinuity, null);
+    assert.equal(report.mapped, "mapped");
+  }
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(3) });
+  assert.equal(inspected.status, "valid");
+  assert.equal(inspected.state.watermark, 3);
+  assert.equal(inspected.state.passes[3].observation_ts, iso(3), "item 16: the durable pass -> observation mapping");
+  assert.deepEqual(unscoredPasses(inspected.state), []);
+});
+
+test("pending_fast_tick_no_discontinuity: a tick with no committed pass writes nothing", async () => {
+  const paths = await tempPaths();
+  await scoredTick(paths, 1);
+  const { report } = await journalCommittedPass(paths, FAMILY, { passResult: { written_count: 0 }, ledger: ledgerAt(1), ts: iso(1.5) });
+  assert.equal(report.mapped, "no_committed_pass");
+  assert.equal(report.discontinuity, null);
+});
+
+test("watermark_unscorable_pass_excluded: a committed pass never scored is excluded(unadjudicated), never silently normal", async () => {
+  const paths = await tempPaths();
+  await scoredTick(paths, 1);
+  await scoredTick(paths, 2, { score: false }); // crash between the fact commit and detection
+  const { handle } = await scoredTick(paths, 3);
+  const range = handle.state.ranges.find((entry) => entry.reason === "unadjudicated");
+  assert.deepEqual([range.pass_from, range.pass_to, range.observation_ts_from], [2, 2, iso(2)]);
+  assert.equal(handle.state.watermark, 3);
+  assert.equal(handle.state.passes[2].excluded, "unadjudicated");
+});
+
+test("item 16: passes the ledger committed but the journal never mapped are an explicit excluded range", async () => {
+  const paths = await tempPaths();
+  await scoredTick(paths, 1);
+  const { handle } = await scoredTick(paths, 4);
+  const range = handle.state.ranges.find((entry) => entry.reason === "unmapped_pass");
+  assert.deepEqual([range.pass_from, range.pass_to, range.observation_ts_from, range.observation_ts_to], [2, 3, iso(1), iso(4)]);
+});
+
+test("pending_stale_checkpoint_rebuilt: a missing or stale checkpoint is rebuilt with no loss", async () => {
+  const paths = await tempPaths();
+  const { checkpointFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await scoredTick(paths, 1);
+  const stale = await fs.readFile(checkpointFile, "utf8");
+  await scoredTick(paths, 2);
+  await fs.writeFile(checkpointFile, stale);
+  const fromStale = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(2) });
+  assert.equal(fromStale.status, "valid");
+  assert.equal(fromStale.state.watermark, 2);
+  await fs.rm(checkpointFile);
+  const rebuilt = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(2) });
+  assert.equal(rebuilt.status, "valid");
+  assert.equal(rebuilt.state.watermark, 2);
+});
+
+test("a checkpoint that contradicts the journal is a discontinuity with an open epoch and suspended admission", async () => {
+  const paths = await tempPaths();
+  const { checkpointFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await scoredTick(paths, 1);
+  const checkpoint = JSON.parse(await fs.readFile(checkpointFile, "utf8"));
+  checkpoint.stamp.journal_head_hash = "0".repeat(64);
+  await fs.writeFile(checkpointFile, JSON.stringify(checkpoint));
+  const { report, handle } = await scoredTick(paths, 2);
+  assert.equal(report.discontinuity.cause, "checkpoint_contradicts_journal");
+  assert.equal(handle.state.open_epoch, 1);
+  assert.deepEqual(pendingAdmissionStatus(handle.state, iso(2)), { suspended: true, reason: "open_epoch" });
+  assert.equal(pendingMembership(handle.state).length, 1, "one unexplained_discontinuity item holds the uncertain membership");
+});
+
+test("pending_journal_corrupt_fails_closed: a broken chain restarts on a new chain, keeps the broken file aside", async () => {
+  const paths = await tempPaths();
+  const { journalFile, brokenFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await scoredTick(paths, 1);
+  await scoredTick(paths, 2);
+  const lines = (await fs.readFile(journalFile, "utf8")).trim().split("\n");
+  const edited = JSON.parse(lines[0]);
+  edited.observation_ts = iso(99);
+  lines[0] = JSON.stringify(edited);
+  await fs.writeFile(journalFile, `${lines.join("\n")}\n`);
+  const { report, handle } = await scoredTick(paths, 3);
+  assert.equal(report.discontinuity.cause, "chain_broken");
+  await fs.access(brokenFile);
+  const restarted = (await fs.readFile(journalFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(restarted[0].kind, "discontinuity");
+  assert.equal(restarted[0].restart, true);
+  assert.ok(restarted[0].prev_hash.startsWith("lost:"));
+  assert.equal((await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(3) })).status, "valid");
+  assert.equal(handle.state.open_epoch, 1);
+});
+
+async function journalWithItems(paths, entriesFor) {
+  const ledger = ledgerAt(1);
+  const { handle } = await journalCommittedPass(paths, FAMILY, { passResult: passResult(1), ledger, ts: iso(1) });
+  await appendPendingEntries(paths, handle, entriesFor(), { ledger, now: iso(1) });
+  await checkpointPendingJournal(paths, handle, { ledger, passId: 1 });
+  return handle;
+}
+
+const idA = pendingItemId({ ...ITEM, incident_key: "a" });
+const idB = pendingItemId({ ...ITEM, incident_key: "b" });
+
+test("pending_discontinuity_keeps_quarantine and pending_discontinuity_unverified_admission_not_honoured", async () => {
+  const paths = await tempPaths();
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await journalWithItems(paths, () => [
+    { kind: "opened", item: { ...ITEM, incident_key: "a" }, item_id: idA, scored_pass_id: 1, pass_time_ms: T0 + HOUR, tick: { ts: iso(1), pass_id: 1 } },
+    { kind: "opened", item: { ...ITEM, incident_key: "b" }, item_id: idB, scored_pass_id: 1, pass_time_ms: T0 + HOUR, tick: { ts: iso(1), pass_id: 1 } },
+    { kind: "quarantined", item_id: idA, reason: "label" },
+    { kind: "admitted", item_id: idB, source: "label", scored_pass_id: 1, pass_time_ms: T0 + HOUR },
+  ]);
+  // Corrupt the admission entry: the verified prefix ends before it; the checkpoint (which still says
+  // admitted) no longer matches the journal and is only an unverifiable survivor.
+  const lines = (await fs.readFile(journalFile, "utf8")).trim().split("\n");
+  const last = JSON.parse(lines.at(-1));
+  last.source = "earned_promotion";
+  lines[lines.length - 1] = JSON.stringify(last);
+  await fs.writeFile(journalFile, `${lines.join("\n")}\n`);
+  const handle = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
+  assert.equal(handle.discontinuity.cause, "chain_broken");
+  assert.equal(handle.state.items[idA].state, "quarantined", "a surviving quarantine is kept");
+  assert.equal(handle.state.items[idB].state, "pending", "an admission only an unverifiable source records is never honoured");
+});
+
+test("a lost journal keeps the checkpoint's quarantine; nothing quarantined is ever released", async () => {
+  const paths = await tempPaths();
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await journalWithItems(paths, () => [
+    { kind: "opened", item: { ...ITEM, incident_key: "a" }, item_id: idA, scored_pass_id: 1, pass_time_ms: T0 + HOUR },
+    { kind: "quarantined", item_id: idA, reason: "label" },
+  ]);
+  await fs.rm(journalFile);
+  const handle = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
+  assert.equal(handle.discontinuity.cause, "journal_missing");
+  assert.equal(handle.state.items[idA].state, "quarantined");
+});
+
+test("both journal and checkpoint deleted, with a surviving witness, is a discontinuity, never a first run", async () => {
+  const paths = await tempPaths();
+  const { dir } = resolvePendingJournalPaths(paths, FAMILY);
+  await scoredTick(paths, 1);
+  await fs.rm(dir, { recursive: true });
+  const { report } = await scoredTick(paths, 2, { witnessExists: true });
+  assert.equal(report.discontinuity.cause, "journal_and_checkpoint_missing");
+  const fresh = await tempPaths();
+  const { report: first } = await scoredTick(fresh, 1);
+  assert.equal(first.created, true);
+  assert.equal(first.discontinuity, null);
+});
+
+test("pending_recertifies_after_clean_pass: the first clean certified pass after the break closes the epoch", async () => {
+  const paths = await tempPaths();
+  const { checkpointFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await scoredTick(paths, 1);
+  await fs.writeFile(checkpointFile, "{not json");
+  // Unparseable checkpoint with no cut: only an optimisation lost, no epoch.
+  const { report: rebuilt } = await scoredTick(paths, 2);
+  assert.equal(rebuilt.discontinuity, null);
+  const checkpoint = JSON.parse(await fs.readFile(checkpointFile, "utf8"));
+  checkpoint.stamp.journal_seq = 999;
+  await fs.writeFile(checkpointFile, JSON.stringify(checkpoint));
+  const { report: broke } = await scoredTick(paths, 3);
+  assert.equal(broke.discontinuity.cause, "journal_truncated");
+  assert.equal(broke.recertified, null, "the pass of the detecting tick does not re-certify");
+  const { report: next, handle } = await scoredTick(paths, 4);
+  assert.equal(next.recertified, 1);
+  assert.equal(handle.state.open_epoch, null);
+  assert.equal(pendingAdmissionStatus(handle.state, iso(4)).suspended, false);
+  assert.equal(pendingMembership(handle.state).length, 1, "the unexplained item stays pending after re-certification");
+});
+
+test("pending_discontinuity_budget_exhausted_suspends_unattended beyond the per-family budget", () => {
+  let state = emptyPendingState(FAMILY);
+  for (let epoch = 1; epoch <= 4; epoch += 1) {
+    state = foldPendingEntries(state, [
+      { seq: epoch * 2 - 1, hash: `h${epoch}a`, kind: "discontinuity", epoch, cause: "chain_broken", ts: iso(epoch), pass_id: epoch },
+      { seq: epoch * 2, hash: `h${epoch}b`, kind: "recertified", epoch, ts: iso(epoch + 0.5) },
+    ]);
+  }
+  assert.deepEqual(pendingAdmissionStatus(state, iso(5)), { suspended: true, reason: "discontinuity_budget", epochs_in_window: 4 });
+  assert.equal(pendingAdmissionStatus(state, new Date(T0 + 31 * 24 * HOUR).toISOString()).suspended, false, "back within budget once the trailing count drops");
+});
+
+test("a ledger generation change is a discontinuity on the intact chain; the pass map restarts", async () => {
+  const paths = await tempPaths();
+  await scoredTick(paths, 5);
+  const ledger = ledgerAt(1, { generation: "gen-b" });
+  const { report, handle } = await journalCommittedPass(paths, FAMILY, { passResult: { written_count: 2, retention: { pass_id: 1, ledger_generation: "gen-b", pass_time_ms: T0 + 6 * HOUR } }, ledger, ts: iso(6) });
+  assert.equal(report.discontinuity.cause, "generation_change");
+  assert.equal(handle.state.passes[1]?.observation_ts, iso(6));
+  assert.equal(pendingMembership(handle.state).length, 0, "an intact chain has no uncertain membership");
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  const records = (await fs.readFile(journalFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(records.some((record) => record.restart), false);
+});
+
+test("pending_entry_valid_after_source_age_eviction: certified at write, valid after its source pass ages out", async () => {
+  const paths = await tempPaths();
+  await journalWithItems(paths, () => [
+    { kind: "opened", item: ITEM, item_id: pendingItemId(ITEM), scored_pass_id: 1, pass_time_ms: T0 + HOUR, tick: { ts: iso(1), pass_id: 1 } },
+  ]);
+  const aged = ledgerAt(40, { ageFloorHours: 30 });
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: aged });
+  assert.equal(inspected.status, "valid");
+  assert.equal(inspected.state.items[pendingItemId(ITEM)].state, "pending");
+  // Retention drops the tick mark (the tick is gone) but the item stays pending.
+  const handle = await openPendingJournal(paths, FAMILY, { ledger: aged, now: iso(40) });
+  await checkpointPendingJournal(paths, handle, { ledger: aged, passId: 40 });
+  const after = await inspectPendingJournal(paths, FAMILY, { ledger: aged });
+  assert.deepEqual(after.state.items[pendingItemId(ITEM)].ticks, []);
+  assert.equal(after.state.items[pendingItemId(ITEM)].state, "pending");
+});
+
+test("certification at write refuses an entry outside the certified span or citing an uncommitted pass", async () => {
+  const paths = await tempPaths();
+  const ledger = ledgerAt(3, { ageFloorHours: 2 });
+  const handle = await openPendingJournal(paths, FAMILY, { ledger, now: iso(3) });
+  await assert.rejects(appendPendingEntries(paths, handle, [{ kind: "opened", item: ITEM, item_id: pendingItemId(ITEM), scored_pass_id: 9, pass_time_ms: T0 + 3 * HOUR }], { ledger, now: iso(3) }), PendingJournalWriteRefused);
+  await assert.rejects(appendPendingEntries(paths, handle, [{ kind: "opened", item: ITEM, item_id: pendingItemId(ITEM), scored_pass_id: 1, pass_time_ms: T0 + HOUR }], { ledger, now: iso(3) }), PendingJournalWriteRefused);
+  await assert.rejects(appendPendingEntries(paths, handle, [{ kind: "admitted", item_id: "x", source: "federated_signature", scored_pass_id: 3, pass_time_ms: T0 + 3 * HOUR }], { ledger, now: iso(3) }), PendingJournalWriteRefused, "federated_signature is reserved and inactive");
+  // Restrictive entries never need certification.
+  await appendPendingEntries(paths, handle, [{ kind: "excluded", reason: "unadjudicated", pass_from: 1, pass_to: 1 }], { ledger: null, now: iso(3) });
+  assert.equal(handle.state.ranges.length, 1);
+});
+
+test("pending_cap_compacts_to_excluded: at the cap the oldest unadmitted items compact, never fold, never freeze", () => {
+  let state = emptyPendingState(FAMILY);
+  const entries = [];
+  for (let index = 0; index < MAX_OPEN_PENDING_ITEMS; index += 1) {
+    const item = { ...ITEM, incident_key: `k${index}` };
+    entries.push({ seq: index + 1, hash: `h${index}`, kind: "opened", item, item_id: pendingItemId(item), ts: iso(1) });
+  }
+  state = foldPendingEntries(state, entries);
+  const compaction = compactionEntriesForCap(state, 1);
+  assert.equal(compaction.length, 1);
+  assert.deepEqual(compaction[0].item_ids, [pendingItemId({ ...ITEM, incident_key: "k0" })]);
+  state = foldPendingEntries(state, [{ seq: MAX_OPEN_PENDING_ITEMS + 1, hash: "hc", ...compaction[0], ts: iso(2) }]);
+  assert.equal(state.items[pendingItemId({ ...ITEM, incident_key: "k0" })].state, "excluded");
+  assert.equal(state.excluded_summary.by_reason.compacted, 1);
+  assert.equal(pendingMembership(state).length, MAX_OPEN_PENDING_ITEMS - 1);
+});
+
+test("a cut journal verifies through its header; losing the checkpoint after a cut is a discontinuity", async () => {
+  const paths = await tempPaths();
+  const { checkpointFile } = resolvePendingJournalPaths(paths, FAMILY);
+  for (let pass = 1; pass <= 3; pass += 1) {
+    const ledger = ledgerAt(pass);
+    const { handle } = await journalCommittedPass(paths, FAMILY, { passResult: passResult(pass), ledger, ts: iso(pass) });
+    await appendPendingEntries(paths, handle, [{ kind: "scored_through", pass_id: pass, pass_time_ms: T0 + pass * HOUR }], { ledger, now: iso(pass) });
+    await checkpointPendingJournal(paths, handle, { ledger, passId: pass, maxJournalBytes: 100 });
+  }
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(3) });
+  assert.equal(inspected.status, "valid");
+  assert.equal(inspected.state.watermark, 3);
+  await fs.rm(checkpointFile);
+  const lost = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(3) });
+  assert.equal(lost.status, "discontinuity");
+  assert.equal(lost.cause, "checkpoint_missing_after_cut");
+});

@@ -56,3 +56,114 @@ test("a transition-log failure never affects alerting", async () => {
   assert.equal(results.at(-1).alertTransitions.status, "error");
   assert.ok((await readAlertRecords(paths)).some((alert) => alert.rule_id === "system.memory.sustained_high" && alert.status === "active"));
 });
+
+// ------------------------------------------------------------------------------------------------
+// C1.4: the pending journal rides every completed structural tick.
+// ------------------------------------------------------------------------------------------------
+import { inspectPendingJournal, resolvePendingJournalPaths } from "../src/pending-journal.js";
+import { readFactIntegrityLedger } from "../src/fact-store-integrity.js";
+
+const HOUR = 3_600_000;
+const T0 = Date.parse("2026-10-11T08:00:00.000Z");
+const BOOT = "11111111-2222-3333-4444-555555555555";
+
+function structuralHarness(paths) {
+  const state = { checkpoint: undefined, sessions: { work: 1_000_100 } };
+  const probe = (nowMs) => ({
+    platform: "darwin",
+    status: "ok",
+    boot: { boot_id: BOOT, boot_id_source: "kern.bootsessionuuid", boot_time_s: 1_000_000, os_build: "25C56", os_release: "25.2.0" },
+    clocks: { wall_ms: nowMs, uv_hrtime_ns: "1", uv_version: "1.52.1", os_uptime_ms: nowMs - 1_000_000_000, kern_waketime_s: 0, kern_sleeptime_s: 0, kern_monotonicclock_usecs: "1 2", machdep_wake_abstime: "0", machdep_wake_conttime: "0", tz_id: "Europe/Paris", utc_offset_min: 120 },
+  });
+  const run = async (nowMs, extra = {}) => runDaemonIteration(paths, {
+    profile: {
+      interval_ms: 60000,
+      collectors: { system: { enabled: true }, processes: { enabled: true }, disks: { enabled: true } },
+      structural: { interval_ms: HOUR, collectors: { sessions: { enabled: true }, "host-lifecycle": { enabled: true } } },
+    },
+    collectors: collectorsWithMemory(0.1),
+    structuralCollectors: {
+      sessions: async () => envelope("sessions", "collect_sessions", {
+        multiplexers: [{ multiplexer: "tmux", status: "ok", binary_provenance: { requested_binary: "tmux", trust_verdict: "trusted", resolved_path: "/usr/bin/tmux", same_uid_writable_components: [] } }],
+        sessions: Object.entries(state.sessions).map(([name, created]) => ({ multiplexer: "tmux", session_name: name, window_count: 1, attached: true, created_at_epoch_seconds: created })),
+        total_count: Object.keys(state.sessions).length,
+        truncated: false,
+      }),
+      "host-lifecycle": async () => ({ ...envelope("host-lifecycle", "collect_host_lifecycle", probe(nowMs)), observation: { start_ms: nowMs + 10, end_ms: nowMs + 20 } }),
+    },
+    hostLifecycleProbe: async () => probe(nowMs),
+    daemonInstance: { nonce: "daemon-a", start_ms: T0 - HOUR },
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => {
+      state.checkpoint = checkpoint.last_structural_run_ms;
+      return checkpoint;
+    },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+    deliverNotification: async () => ({ status: "cli_only" }),
+    ...extra,
+  });
+  return { state, run };
+}
+
+test("each structural tick maps the session pass and advances its watermark, after alerts and transitions", async () => {
+  const paths = await tempPaths();
+  const { run } = structuralHarness(paths);
+  let result;
+  for (let tick = 0; tick < 3; tick += 1) result = await run(T0 + tick * HOUR);
+  assert.equal(result.pendingJournal.session.status, "ok");
+  const { ledger } = await readFactIntegrityLedger(paths, "session");
+  const inspected = await inspectPendingJournal(paths, "session", { ledger });
+  assert.equal(inspected.status, "valid");
+  assert.equal(inspected.state.watermark, ledger.continuity.last_committed_pass_id);
+  assert.equal(inspected.state.passes[inspected.state.watermark].observation_ts, new Date(T0 + 2 * HOUR).toISOString());
+  const log = await readAlertTransitions(paths);
+  assert.ok(log.records.some((record) => record.kind === "pending_journal_created" && record.family === "session"));
+});
+
+test("a pass whose alerts were not persisted is never scored: the next tick excludes it as unadjudicated", async () => {
+  const paths = await tempPaths();
+  const { run } = structuralHarness(paths);
+  await run(T0);
+  await run(T0 + HOUR, { evaluateAlerts: false });
+  await run(T0 + 2 * HOUR);
+  const { ledger } = await readFactIntegrityLedger(paths, "session");
+  const inspected = await inspectPendingJournal(paths, "session", { ledger });
+  assert.ok(inspected.state.ranges.some((range) => range.reason === "unadjudicated" && range.observation_ts_from === new Date(T0 + HOUR).toISOString()));
+  const log = await readAlertTransitions(paths);
+  assert.ok(log.records.some((record) => record.kind === "excluded_unadjudicated" && record.family === "session"));
+});
+
+test("pending_truncation_never_stops_detection: a wiped journal is a witnessed discontinuity, notified once, re-certified next tick", async () => {
+  const paths = await tempPaths();
+  const { run } = structuralHarness(paths);
+  const notices = [];
+  const deliverNotification = async (_paths, decision, meta) => {
+    notices.push(meta?.ruleId);
+    return { status: "cli_only" };
+  };
+  await run(T0, { deliverNotification });
+  await run(T0 + HOUR, { deliverNotification });
+  await fs.rm(resolvePendingJournalPaths(paths, "session").dir, { recursive: true });
+  const broken = await run(T0 + 2 * HOUR, { deliverNotification });
+  assert.equal(broken.pendingJournal.session.discontinuity.cause, "journal_and_checkpoint_missing");
+  assert.equal(broken.pendingJournal.session.admission.suspended, true);
+  assert.equal(notices.filter((id) => id === "integrity.pending_discontinuity").length, 1);
+  assert.equal(broken.status.state, "ok", "detection and the daemon's health are unaffected");
+  const next = await run(T0 + 3 * HOUR, { deliverNotification });
+  assert.equal(next.pendingJournal.session.open_epoch, null);
+  assert.equal(next.pendingJournal.session.admission.suspended, false);
+  assert.equal(notices.filter((id) => id === "integrity.pending_discontinuity").length, 1, "one notice per epoch");
+  const log = await readAlertTransitions(paths);
+  assert.ok(log.records.some((record) => record.kind === "recertified" && record.family === "session"));
+});
+
+test("a pending-journal failure never fails the tick or touches alerting", async () => {
+  const paths = await tempPaths();
+  const { run } = structuralHarness(paths);
+  const result = await run(T0, { runPendingJournalPrePass: async () => { throw new Error("EACCES"); } });
+  assert.equal(result.pendingJournal, undefined);
+  assert.equal(result.status.state, "ok");
+});

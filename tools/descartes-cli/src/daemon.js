@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { recordAlertTransitions } from "./alert-transitions.js";
+import { finishPendingJournalTick, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -1316,6 +1317,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // safeCandidates -- see its doc comment above) so a genuine structural-fact append failure can
   // feed this tick's own status.state/storage_write_error below.
   let structuralFactPersistError;
+  // Context plan C1.4: per-family pending-journal handles opened after this tick's fact commit.
+  let pendingJournalPrePass;
   let shadowEvaluation;
   let contextKeyStatus;
   let bootLedgerError;
@@ -1570,6 +1573,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
             console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
             structuralFacts = { written_count: 0, retention: undefined };
+          }
+
+          // Context plan C1.4 (item 16, I69, I54): after the commit and BEFORE detection, map each
+          // journaled family's committed pass to its observation time, journal unmapped/unscored
+          // passes as excluded ranges, detect discontinuities and re-certify. Foundation only: it
+          // never changes detection, and a failure here is reported, never fatal to the tick.
+          try {
+            pendingJournalPrePass = await (options.runPendingJournalPrePass ?? runPendingJournalPrePass)(descartesPaths, { structuralFacts, ts, deliverNotification: options.deliverNotification });
+          } catch (error) {
+            pendingJournalPrePass = undefined;
+            console.warn(`descartes: pending journal pre-pass failed (${error instanceof Error ? error.message : String(error)}); detection is unaffected`);
           }
 
           // C2-only families are a second, explicit pass. Their outcome is carried on context_c2 and
@@ -2492,16 +2506,31 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // alert store against the log's projection after every write of this tick (detection, delivery
   // outcomes) and appends the transitions. Audit only: a failure here never affects alerting.
   let alertTransitions;
-  if (alerts) {
+  if (alerts || pendingJournalPrePass) {
     try {
-      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, { now: ts });
+      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, { now: ts, extraRecords: pendingJournalAuditRecords(pendingJournalPrePass) });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       alertTransitions = { status: "error", error: message };
       console.warn(`descartes: alert transition log write failed (${message}); alerting is unaffected`);
     }
   }
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions };
+  // C1.4 write order (§6.4.2): journal entries, then alerts.json and the transition log, then the
+  // scored-through watermark. A family is scored only if the alert store persisted and none of its
+  // detectors failed; otherwise its pass stays unscored and is excluded(unadjudicated) next tick.
+  let pendingJournal;
+  if (pendingJournalPrePass) {
+    try {
+      pendingJournal = await finishPendingJournalTick(descartesPaths, pendingJournalPrePass, {
+        ts,
+        alertsPersisted: Boolean(mainAlerts) && !alertPersistenceError,
+        failedDetectorLabels,
+      });
+    } catch (error) {
+      pendingJournal = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
