@@ -16,6 +16,7 @@ import {
 import {
   deriveAlertTransitions,
   projectAlerts,
+  reconcileAlertClosures,
   readAlertTransitions,
   recordAlertTransitions,
   resolveAlertTransitionPaths,
@@ -152,6 +153,42 @@ test("a crash between the log append and the state write folds the suffix: no du
   assert.equal(report.rebaselined, null);
   const log = await readAlertTransitions(paths);
   assert.equal(log.records.filter((record) => record.kind === "activated").length, 1);
+});
+
+test("same_uid_forged_closed_is_restored_and_audited: only a daemon closure witness may close an incident", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: t(0), alerts: [] });
+  await tick(paths, [candidate("forged")], 1);
+  const [open] = await readAlertRecords(paths);
+  const forged = {
+    ...open,
+    status: "closed",
+    closed_reason: "label",
+    closed_at: t(2),
+    closed_by: { kind: "label", ref: "forged-label" },
+    incidents: {
+      ...open.incidents,
+      forged: { ...open.incidents.forged, status: "closed", closed_reason: "label", closed_at: t(2), closed_by: { kind: "label", ref: "forged-label" } },
+    },
+  };
+  await writeAlertRecords(paths, [forged]);
+
+  const repaired = await reconcileAlertClosures(paths, { now: t(3) });
+  assert.ok(repaired.changes.length >= 1);
+  assert.match(repaired.changes.find((change) => change.incident_key === "forged").digest, /^[0-9a-f]{64}$/);
+  await writeAlertRecords(paths, repaired.alerts);
+  await recordAlertTransitions(paths, { now: t(3), extraRecords: repaired.audit });
+
+  const [restored] = await readAlertRecords(paths);
+  assert.equal(restored.status, "active");
+  assert.equal(restored.incidents.forged.status, "active");
+  assert.equal(restored.incidents.forged.confirmed_at, null, "the prior open/due state is restored");
+  assert.equal(restored.integrity_status, "unattributed_change");
+  const log = await readAlertTransitions(paths);
+  const change = log.records.find((record) => record.kind === "unattributed_change");
+  assert.equal(change.alert_id, ID);
+  assert.equal(change.incident_key, "forged");
+  assert.equal(change.digest, repaired.changes.find((entry) => entry.incident_key === "forged").digest);
 });
 
 test("a missing state over an existing log rebaselines visibly", async () => {

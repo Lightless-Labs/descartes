@@ -5,12 +5,12 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { recordAlertTransitions } from "./alert-transitions.js";
+import { reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
 import { deliverPendingDiscontinuityNotice, deliverPendingJournalNotices, finishPendingJournalTick, notificationOutcome, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
-import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
+import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID, writeAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
@@ -2544,9 +2544,28 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
   }
   let alertTransitions;
+  let closureReconciliation;
   if (alerts || pendingJournalPrePass) {
     try {
-      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, { now: ts, extraRecords: [...pendingJournalAuditRecords(pendingJournalPrePass), ...(labelIngestion?.audit ?? [])] });
+      const deliveryOutcomes = [
+        ...(delivered?.sessionAlertDelivery?.delivery_outcomes ?? []),
+        ...(delivered?.metricAlertFallback?.delivery_outcomes ?? []),
+        ...(delivered?.alertIntelligence?.delivery_outcomes ?? []),
+      ];
+      const authorizedClosures = deliveryOutcomes
+        .filter((outcome) => outcome.status === "success")
+        .map((outcome) => ({ kind: "closure_authorized", alert_id: outcome.alertId, incident_key: outcome.incidentKey, reason: "event_delivered" }));
+      closureReconciliation = await reconcileAlertClosures(descartesPaths, { now: ts, authorizedClosures });
+      if (closureReconciliation.changes.length > 0) await writeAlertRecords(descartesPaths, closureReconciliation.alerts);
+      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, {
+        now: ts,
+        extraRecords: [
+          ...pendingJournalAuditRecords(pendingJournalPrePass),
+          ...(labelIngestion?.audit ?? []),
+          ...authorizedClosures,
+          ...closureReconciliation.audit,
+        ],
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       alertTransitions = { status: "error", error: message };

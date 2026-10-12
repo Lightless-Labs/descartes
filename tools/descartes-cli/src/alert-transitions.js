@@ -19,7 +19,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { normalizeAlertRecord, readAlertRecords } from "./alert-store.js";
+import { normalizeAlertRecord, readAlertRecords, writeAlertRecords } from "./alert-store.js";
 import { EDGE_REARM_RULE_IDS } from "./alert-stream-kinds.js";
 import { appendLines, atomicWrite, canonicalJson, GENESIS_PREV_HASH, readJsonlStrict, sealRecord, trimTornTail, verifyChain } from "./hash-chain.js";
 
@@ -62,6 +62,9 @@ export function projectAlerts(alerts) {
       incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, {
         status: incident.status,
         severity_max: incident.severity_max,
+        confirmed_at: incident.confirmed_at,
+        notified_severity: incident.notified_severity,
+        close_on_delivery: incident.close_on_delivery === true,
       }])),
     };
   }
@@ -113,7 +116,7 @@ export function deriveAlertTransitions(projection, alerts, { now } = {}) {
       }
       if (incident.status === "closed" && old.status !== "closed") {
         const closedReason = normalizedById.get(id)?.incidents?.[key]?.closed_reason ?? null;
-        records.push({ ...base, kind: "incident_closed", incident_key: key, reason: closedReason });
+        records.push({ ...base, kind: "incident_closed", incident_key: key, reason: closedReason, source: normalizedById.get(id)?.incidents?.[key]?.closed_by ?? null });
       }
     }
     if (prev && !episodeChanged) {
@@ -122,7 +125,7 @@ export function deriveAlertTransitions(projection, alerts, { now } = {}) {
       }
       if (cur.status === "closed" && prev.status !== "closed") {
         const closedReason = normalizedById.get(id)?.closed_reason ?? null;
-        records.push({ ...base, kind: "alert_closed", reason: closedReason });
+        records.push({ ...base, kind: "alert_closed", reason: closedReason, source: normalizedById.get(id)?.closed_by ?? null });
       }
       if (cur.status === "acknowledged" && prev.status === "active") {
         records.push({ ...base, kind: "acknowledged" });
@@ -139,6 +142,97 @@ export function deriveAlertTransitions(projection, alerts, { now } = {}) {
     }
   }
   return records;
+}
+
+function closureKey(alertId, incidentKey = null) {
+  return `${alertId}\u0000${incidentKey ?? ""}`;
+}
+
+function closureWitnesses(records = [], extra = []) {
+  const known = new Set();
+  for (const record of [...records, ...extra]) {
+    if (record?.kind !== "closure_authorized" || typeof record.alert_id !== "string") continue;
+    known.add(closureKey(record.alert_id, record.incident_key));
+  }
+  return known;
+}
+
+async function priorProjectionForReconciliation(descartesPaths, log) {
+  try {
+    const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
+    const state = JSON.parse(await fs.readFile(stateFile, "utf8"));
+    if (state?.projection?.alerts && Number.isSafeInteger(state.head_seq)) {
+      return foldTransitionRecords(state.projection, (log.records ?? []).filter((record) => record.seq > state.head_seq));
+    }
+  } catch {
+    // A missing/invalid projection cannot prove a prior closure. The next chain record remains a
+    // visible rebaseline; never guess a closure witness from the mutable alert store.
+  }
+  return null;
+}
+
+/**
+ * Repairs a closed alert/incident that was not authorized by a daemon closure record. The
+ * transition projection is the only prior-state witness; current closed_by/reason fields are never
+ * treated as proof. Returns an alert array and audit records for the caller's single daemon write.
+ */
+export async function reconcileAlertClosures(descartesPaths, { now, alerts, authorizedClosures = [] } = {}) {
+  const current = alerts ?? await readAlertRecords(descartesPaths);
+  const log = await readAlertTransitions(descartesPaths);
+  const prior = await priorProjectionForReconciliation(descartesPaths, log);
+  if (!prior) return { alerts: current, changes: [], audit: [], notices: [] };
+  const authorized = closureWitnesses(log.records, authorizedClosures);
+  const at = new Date(now ?? Date.now()).toISOString();
+  const repaired = [];
+  const next = current.map((raw) => {
+    const alert = normalizeAlertRecord(raw);
+    const before = prior.alerts?.[alert.id];
+    if (!before) return alert;
+    let changed = false;
+    const incidents = { ...alert.incidents };
+    for (const [key, incident] of Object.entries(incidents)) {
+      if (incident.status !== "closed" || before.incidents?.[key]?.status === "closed") continue;
+      if (authorized.has(closureKey(alert.id, key))) continue;
+      const digest = crypto.createHash("sha256").update(canonicalJson({ alert_id: alert.id, incident_key: key, status: "closed", reason: incident.closed_reason, closed_at: incident.closed_at, closed_by: incident.closed_by })).digest("hex");
+      const priorIncident = before.incidents?.[key];
+      incidents[key] = {
+        ...incident,
+        ...(priorIncident ? {
+          status: priorIncident.status === "closed" ? "active" : priorIncident.status,
+          confirmed_at: priorIncident.confirmed_at ?? null,
+          notified_severity: priorIncident.notified_severity ?? null,
+          close_on_delivery: priorIncident.close_on_delivery === true,
+        } : { status: "active", confirmed_at: null, notified_severity: null }),
+        closed_reason: null,
+        closed_at: null,
+        closed_by: null,
+        close_requested: null,
+      };
+      repaired.push({ alert_id: alert.id, incident_key: key, digest });
+      changed = true;
+    }
+    const alertWasClosed = alert.status === "closed" && before.status !== "closed" && !authorized.has(closureKey(alert.id));
+    if (alertWasClosed) {
+      const digest = crypto.createHash("sha256").update(canonicalJson({ alert_id: alert.id, status: "closed", reason: alert.closed_reason, closed_at: alert.closed_at, closed_by: alert.closed_by })).digest("hex");
+      repaired.push({ alert_id: alert.id, incident_key: null, digest });
+      changed = true;
+    }
+    if (!changed) return alert;
+    const repairedAlert = normalizeAlertRecord({ ...alert, ...before, status: before.status === "closed" ? "active" : before.status, closed_reason: null, closed_at: null, closed_by: null, close_requested: null, incidents, integrity_status: "unattributed_change", integrity_digest: repaired.at(-1).digest, integrity_at: at });
+    return repairedAlert;
+  });
+  const audit = repaired.map((change) => ({ kind: "unattributed_change", alert_id: change.alert_id, incident_key: change.incident_key, digest: change.digest, status: "repaired" }));
+  return {
+    alerts: next,
+    changes: repaired,
+    audit,
+    notices: repaired.map((change) => ({
+      notify: true,
+      severity: "critical",
+      title: "Descartes: unattributed alert-state change",
+      body: `Restored ${change.alert_id}${change.incident_key ? `/${change.incident_key}` : ""} from the transition witness; digest ${change.digest.slice(0, 16)}.`,
+    })),
+  };
 }
 
 // Folds already-logged records onto a projection (crash recovery: the log advanced but the state

@@ -398,6 +398,9 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
       journal_effects: journalEffects.length,
       ...(wasHeld ? { released_from_hold: true } : {}),
     });
+    for (const incidentKey of alertEffect.closed) {
+      report.audit.push({ kind: "closure_authorized", alert_id: label.scope.alert_id, incident_key: incidentKey, reason: "label", label_id: label.id });
+    }
   }
   state.held = stillHeld;
   // Remember ingested ids for the label memory; the label log is what proves a label existed.

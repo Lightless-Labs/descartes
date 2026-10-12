@@ -470,6 +470,11 @@ export function normalizeAlertRecord(record) {
     incident_storm_failure_count: Number.isInteger(record.incident_storm_failure_count) && record.incident_storm_failure_count > 0 ? record.incident_storm_failure_count : 0,
     legacy_without_episode: legacyWithoutEpisode,
     status,
+    // Same-UID state edits are outside prevention, but this marker is durable evidence that the
+    // daemon found and repaired one. It is intentionally not used to authorize any transition.
+    integrity_status: typeof record.integrity_status === "string" ? record.integrity_status : null,
+    integrity_digest: typeof record.integrity_digest === "string" ? record.integrity_digest : null,
+    integrity_at: record.integrity_at ? normalizeIso(record.integrity_at, "integrity_at") : null,
     closed_reason: status === "closed" ? alertClosure.closed_reason : null,
     closed_at: status === "closed" ? alertClosure.closed_at : null,
     closed_by: status === "closed" ? alertClosure.closed_by : null,
