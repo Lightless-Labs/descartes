@@ -240,3 +240,28 @@ test("tombstone_cap_visible: tombstones are bounded per alert and drops are coun
   assert.equal(after.tombstones_dropped_total, 3);
   assert.equal(after.incidents["c-00000"], undefined, "the oldest closure is dropped first");
 });
+
+test("storm_escalation_notifies: an escalation of a never-delivered incident whose delivery failed is retried inside the storm and never covered", async () => {
+  const paths = await tempPaths();
+  const keys = Array.from({ length: MAX_LIVE_INCIDENTS }, (_, index) => `k-${index}`);
+  const storm = applyAlertCandidates([], [...keys, "overflow"].map((key) => candidate(key)), { now: t(0) });
+  assert.equal(storm.alerts[0].incident_state, "incident_storm");
+  await writeAlertRecords(paths, storm.alerts);
+  await confirmAlertDelivery(paths, ID, { now: t(1), incidentKey: INCIDENT_STORM_KEY });
+  const escalated = applyAlertCandidates(await readAlertRecords(paths), [candidate("k-0", "critical"), candidate("overflow")], { now: t(2) });
+  assert.ok(escalated.notification_due_incidents.some((entry) => entry.incident_key === "k-0"));
+  await writeAlertRecords(paths, escalated.alerts);
+  await recordAlertDeliveryFailure(paths, ID, { now: t(2), incidentKey: "k-0", reason: "unavailable" });
+  const reemitted = applyAlertCandidates(await readAlertRecords(paths), [candidate("k-0", "critical"), candidate("overflow")], { now: t(10) });
+  assert.ok(reemitted.notification_due_incidents.some((entry) => entry.incident_key === "k-0"), "re-emitted after backoff, still due inside the storm");
+  const scanned = applyAlertCandidates(await readAlertRecords(paths), [], { now: t(10), coveredAlertIds: new Set() });
+  assert.ok(scanned.notification_due_incidents.some((entry) => entry.incident_key === "k-0"), "the retry scan finds it inside the storm");
+  // Storm exit: a label closes ten delivered incidents; k-0's escalation is not covered.
+  let [alert] = await readAlertRecords(paths);
+  alert = normalizeAlertRecord({ ...alert, incidents: Object.fromEntries(Object.entries(alert.incidents).map(([key, incident]) => [key, ["k-1", "k-2", "k-3", "k-4", "k-5", "k-6", "k-7", "k-8", "k-9", "k-10"].includes(key) ? { ...incident, confirmed_at: t(1), notified_severity: "warning" } : incident])) });
+  alert = requestAlertClosure(alert, { incidentKeys: ["k-1", "k-2", "k-3", "k-4", "k-5", "k-6", "k-7", "k-8", "k-9", "k-10"], reason: "label", now: t(11) }).alert;
+  const exited = applyAlertCandidates([alert], [candidate("k-0", "critical")], { now: t(20) });
+  assert.equal(exited.alerts[0].incident_state, "normal");
+  assert.equal(exited.alerts[0].incidents["k-0"].storm_covered_at, null);
+  assert.ok(exited.notification_due_incidents.some((entry) => entry.incident_key === "k-0"));
+});

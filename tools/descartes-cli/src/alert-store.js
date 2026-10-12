@@ -402,6 +402,7 @@ export function normalizeAlertRecord(record) {
       storm_covered_at: stormCovered ? stormCoveredAt.toISOString() : null,
       storm_covered_severity: stormCovered ? String(rawIncident.storm_covered_severity) : null,
       reopened_at: rawIncident.reopened_at ? normalizeIso(rawIncident.reopened_at, "incident.reopened_at") : null,
+      escalated_at: rawIncident.escalated_at ? normalizeIso(rawIncident.escalated_at, "incident.escalated_at") : null,
       last_attempt_at: compatibilityLastAttempt ? normalizeIso(compatibilityLastAttempt, "incident.last_attempt_at") : null,
       last_delivery_failure_at: rawIncident.last_delivery_failure_at ? normalizeIso(rawIncident.last_delivery_failure_at, "incident.last_delivery_failure_at") : null,
       delivery_failure_reason: rawIncident.delivery_failure_reason ? String(rawIncident.delivery_failure_reason) : null,
@@ -680,8 +681,10 @@ export function incidentDelivered(incident) {
 
 // An incident that was delivered once (individually or by a storm notification) and has since
 // escalated past what was delivered.
+// `escalated_at` marks an escalation of an existing incident, so an escalation that was never
+// delivered (e.g. its delivery failed inside a storm) stays individually due until it is.
 function escalationPending(incident) {
-  return Boolean(incident) && Boolean(incident.confirmed_at || incident.storm_covered_at) && !incidentDelivered(incident)
+  return Boolean(incident) && Boolean(incident.confirmed_at || incident.storm_covered_at || incident.escalated_at) && !incidentDelivered(incident)
     && !isUndeliverableStatus(incident.status);
 }
 
@@ -920,6 +923,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         // I63: producer-declared close-on-delivery (a learned EVENT incident). Sticky per incident.
         close_on_delivery: incident.close_on_delivery === true || candidate.close_on_delivery === true,
         ...(reopened ? { closed_reason: null, closed_at: null, closed_by: null, close_requested: null, reopened_at: now } : {}),
+        ...(previousIncident && severityEscalated ? { escalated_at: now } : {}),
       };
       const newIncident = !previousIncident;
       const legacySuppressed = next.legacy_without_episode;
@@ -954,6 +958,8 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       const covered = next.incident_storm_notified_at;
       for (const [key, incident] of Object.entries(next.incidents)) {
         if (!isLiveIncident(incident) || incidentDelivered(incident) || !covered) continue;
+        // A pending escalation is never covered by a storm notification: it stays individually due.
+        if (incident.escalated_at) continue;
         // Only incidents that already existed when the storm notification was delivered.
         if (!(Date.parse(incident.first_seen) <= Date.parse(covered))) continue;
         next.incidents[key] = { ...incident, storm_covered_at: covered, storm_covered_severity: incident.severity_max };
