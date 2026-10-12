@@ -218,6 +218,48 @@ test("label_log_tamper_bounded_by_label_budget: deleting the label state never r
   assert.equal((await readAlertRecords(paths)).filter((alert) => alert.status === "closed").length, LABEL_BUDGET_UNITS);
 });
 
+test("label_charge_edit_is_ignored: the transition witness wins over a forged charge", async () => {
+  const paths = await tempPaths();
+  const firstId = "alert_e000000000000010";
+  const secondId = "alert_e000000000000011";
+  await seed(paths, [
+    ...Array.from({ length: 50 }, (_, index) => candidate(firstId, "session.churn", `k-${index}`)),
+    candidate(secondId, "session.churn", "k"),
+  ]);
+  const firstLabel = await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: firstId }, now: iso(2000) });
+  const first = await daemonIngest(paths, iso(3000));
+  assert.equal(first.ingested[0].charge, 50);
+  const { stateFile } = resolveAlertLabelPaths(paths);
+  const forged = JSON.parse(await fs.readFile(stateFile, "utf8"));
+  forged.ingested[firstLabel.id].charge = 0;
+  await fs.writeFile(stateFile, JSON.stringify(forged));
+  await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: secondId }, now: iso(4000) });
+  const second = await daemonIngest(paths, iso(5000));
+  assert.ok(second.audit.some((entry) => entry.kind === "unattributed_change" && entry.field === "charge"));
+  assert.equal(second.ingested.length, 0, "the second label is rejected over budget because the first witness charge is authoritative");
+  assert.equal(second.held.length, 1);
+  assert.equal(JSON.parse(await fs.readFile(stateFile, "utf8")).ingested[firstLabel.id].charge, 50);
+});
+
+test("label_quarantine_write_is_transactional: journal failure leaves the label un-ingested and the alert open for retry", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(LEVEL_ID, "session.count_drop", "lvl:r:2")]);
+  const handle = await openPendingJournal(paths, "session", { now: iso(1000) });
+  const item = { alert_id: LEVEL_ID, episode: iso(0), incident_key: "lvl:r:2" };
+  handle.state.items[pendingItemId(item)] = { item, state: "pending", opened_ts: iso(0), disposition_seq: 0 };
+  await appendAlertLabel(paths, { label: "confirmed_incident", scope: { kind: "alert", alert_id: LEVEL_ID }, now: iso(2000) });
+  const failed = await ingestAlertLabels(paths, {
+    now: iso(3000),
+    handles: { session: handle },
+    deps: { appendPendingEntries: async () => { throw new Error("journal is unwritable"); } },
+  });
+  assert.equal(failed.ingested.length, 0);
+  assert.ok(failed.audit.some((entry) => entry.kind === "label_retry_failed"));
+  assert.equal((await readAlertRecords(paths)).find((alert) => alert.id === LEVEL_ID).status, "active");
+  const retry = await ingestAlertLabels(paths, { now: iso(4000), handles: { session: handle } });
+  assert.equal(retry.ingested.length, 1);
+});
+
 test("an ingested label is never re-ingested after the label state is lost", async () => {
   const paths = await tempPaths();
   await seed(paths, [candidate(EVENT_ID, "session.churn", "k1")]);

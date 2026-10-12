@@ -50,6 +50,8 @@ export const LABEL_BUDGET_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 // (the CLI prunes ingested-age entries beyond it).
 export const LABEL_MEMORY_MS = WITNESS_LABEL_MEMORY_MS;
 export const MAX_LABEL_LOG_BYTES = 1024 * 1024;
+export const MAX_LABEL_RETRIES = 3;
+export const LABEL_RETRY_DELAY_MS = 60_000;
 
 const ALERT_ID_RE = /^alert_[0-9a-f]{16}$/;
 const INCIDENT_KEY_RE = /^(?:[A-Za-z0-9._:-]{1,128}|sha256:[0-9a-f]{64})$/;
@@ -171,10 +173,10 @@ export async function appendAlertLabel(descartesPaths, { label, scope, now, uid 
 async function readIngestionState(stateFile) {
   try {
     const parsed = JSON.parse(await fs.readFile(stateFile, "utf8"));
-    if (parsed?.v !== LABEL_SCHEMA_VERSION || typeof parsed.ingested !== "object" || !Array.isArray(parsed.held)) return { status: "invalid", state: { v: LABEL_SCHEMA_VERSION, ingested: {}, held: [] } };
-    return { status: "valid", state: parsed };
+    if (parsed?.v !== LABEL_SCHEMA_VERSION || typeof parsed.ingested !== "object" || !Array.isArray(parsed.held)) return { status: "invalid", state: { v: LABEL_SCHEMA_VERSION, ingested: {}, held: [], failed: [] } };
+    return { status: "valid", state: { ...parsed, failed: Array.isArray(parsed.failed) ? parsed.failed : [] } };
   } catch (error) {
-    return { status: error?.code === "ENOENT" ? "missing" : "invalid", state: { v: LABEL_SCHEMA_VERSION, ingested: {}, held: [] } };
+    return { status: error?.code === "ENOENT" ? "missing" : "invalid", state: { v: LABEL_SCHEMA_VERSION, ingested: {}, held: [], failed: [] } };
   }
 }
 
@@ -274,31 +276,43 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   // neither reset the label budget nor re-ingest a label.
   let rebuiltFromWitness = 0;
   let witness = null;
-  if (labels.length > 0) {
+  if (labels.length > 0 || Object.keys(state.ingested).length > 0) {
     try {
       witness = await (deps.readAlertTransitionWitness ?? readAlertTransitionWitness)(descartesPaths);
     } catch {
       witness = null;
     }
     for (const [id, entry] of Object.entries(witness?.labels ?? {})) {
-      if (state.ingested[id]) continue;
+      const local = state.ingested[id];
+      if (local && (local.ingested_at !== entry.ingested_at || local.charge !== entry.charge || local.label !== entry.label)) {
+        state.__witnessConflicts ??= [];
+        state.__witnessConflicts.push({ kind: "unattributed_change", label_id: id, field: local.charge !== entry.charge ? "charge" : (local.ingested_at !== entry.ingested_at ? "ingested_at" : "label"), digest: crypto.createHash("sha256").update(JSON.stringify(local)).digest("hex") });
+      }
+      if (!local || local.ingested_at !== entry.ingested_at || local.charge !== entry.charge || local.label !== entry.label) rebuiltFromWitness += 1;
       state.ingested[id] = { ingested_at: entry.ingested_at, charge: entry.charge ?? 0, label: entry.label ?? null, from_witness: true };
-      rebuiltFromWitness += 1;
     }
   }
   const heldIds = new Set(state.held.map((entry) => entry.id));
+  const failedById = new Map((state.failed ?? []).map((entry) => [entry.id, entry]));
   // A future-dated label waits for its own time (review L5: it could otherwise reach any later episode).
-  const fresh = labels.filter((label) => !state.ingested[label.id] && !heldIds.has(label.id) && Date.parse(label.ts) <= nowMs && nowMs - Date.parse(label.ts) <= LABEL_MEMORY_MS);
+  const fresh = labels.filter((label) => !state.ingested[label.id] && !heldIds.has(label.id) && !failedById.get(label.id)?.exhausted && Date.parse(label.ts) <= nowMs && nowMs - Date.parse(label.ts) <= LABEL_MEMORY_MS);
+  const retryable = labels.filter((label) => {
+    const failed = failedById.get(label.id);
+    return failed && !failed.exhausted && Date.parse(failed.retry_at ?? "") <= nowMs;
+  });
   const labelById = new Map(labels.map((label) => [label.id, label]));
-  const queue = [...state.held.map((entry) => labelById.get(entry.id)).filter(Boolean), ...fresh.sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))];
+  const queue = [...state.held.map((entry) => labelById.get(entry.id)).filter(Boolean), ...retryable, ...fresh.sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))]
+    .filter((label, index, all) => all.findIndex((candidate) => candidate.id === label.id) === index);
   const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [], discontinuities: [] };
+  for (const conflict of state.__witnessConflicts ?? []) report.audit.push(conflict);
+  delete state.__witnessConflicts;
   // A missing state with nothing to rebuild is a first use; a state that is invalid, or missing while
   // the witness proves ingestions, was lost: audited and notified.
   const stateLost = labels.length > 0 && (stateRead.status === "invalid" || (stateRead.status === "missing" && rebuiltFromWitness > 0));
   if (stateLost) {
     report.audit.push({ kind: "label_state_rebuilt", state: stateRead.status, rebuilt_from_witness: rebuiltFromWitness });
   }
-  if (queue.length === 0 && stateRead.status === "valid") return report;
+  if (queue.length === 0 && stateRead.status === "valid" && report.audit.length === 0) return report;
 
   let alerts = await (deps.readAlertRecords ?? readAlertRecords)(descartesPaths);
   const alertsById = () => new Map(alerts.map((alert) => [alert.id, alert]));
@@ -315,7 +329,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
         try {
           // The same double-wipe witness and epochs the pre-pass consults (review M3).
           const journalWitness = witness?.pending_journals?.[family];
-          handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts, witnessExists: journalWitness?.created === true, priorEpochs: journalWitness?.epochs ?? [],
+          handles[family] = await (deps.openPendingJournal ?? openPendingJournal)(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts, witnessExists: journalWitness?.created === true, priorEpochs: journalWitness?.epochs ?? [],
             quarantineScopes: labels.filter((entry) => QUARANTINE_LABELS.has(entry.label) && Date.parse(entry.ts) <= nowMs).map((entry) => ({ label_id: entry.id, ts: entry.ts, scope: entry.scope })) });
           // A journal this ingestion creates is witnessed like one the pre-pass creates.
           if (handles[family]?.created) report.audit.push({ kind: "pending_journal_created", family, opened_by: "label_ingestion" });
@@ -344,7 +358,41 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
       }
       continue;
     }
-    // Apply.
+    // Apply the restrictive journal effect first. Alert closure and label ingestion are committed
+    // only after every family append for this label succeeds. A journal write failure leaves the
+    // label un-ingested and retryable, so it cannot close an alert without quarantine evidence.
+    const pendingEffects = new Map();
+    let journalFailed = null;
+    for (const { family, id } of pendingItemsInScope(handles, label, byId)) {
+      const handle = handles[family];
+      if (!handle) continue;
+      const entry = QUARANTINE_LABELS.has(label.label)
+        ? { kind: "quarantined", item_id: id, reason: "label", label_id: label.id }
+        : (ADMISSIBLE_LABELS.has(label.label) ? { kind: "label_marked", item_id: id, label_id: label.id, label: label.label } : null);
+      if (!entry) continue;
+      const effects = pendingEffects.get(family) ?? [];
+      effects.push({ id, entry });
+      pendingEffects.set(family, effects);
+    }
+    for (const [family, effects] of pendingEffects) {
+      try {
+        await (deps.appendPendingEntries ?? appendPendingEntries)(descartesPaths, handles[family], effects.map((effect) => effect.entry), { now: ts, restrictiveOnly: true });
+      } catch (error) {
+        journalFailed = error;
+        break;
+      }
+    }
+    if (journalFailed) {
+      const previous = failedById.get(label.id);
+      const attempts = (previous?.attempts ?? 0) + 1;
+      const exhausted = attempts >= MAX_LABEL_RETRIES;
+      const failure = { id: label.id, attempts, exhausted, retry_at: new Date(nowMs + LABEL_RETRY_DELAY_MS * Math.min(2 ** (attempts - 1), 60)).toISOString(), error: String(journalFailed?.message ?? journalFailed) };
+      failedById.set(label.id, failure);
+      report.audit.push({ kind: "label_retry_failed", label_id: label.id, attempts, exhausted, error: failure.error });
+      continue;
+    }
+
+    // Only now apply the alert-side effect and mark the label ingested.
     let alertEffect = { closed: [], deferred: [], skipped: [], effect: "none" };
     if (label.scope.kind === "alert") {
       const alert = byId.get(label.scope.alert_id);
@@ -358,22 +406,9 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
         alertEffect = { closed: [], deferred: [], skipped: [], effect: "unknown_alert" };
       }
     }
-    const journalEffects = [];
-    for (const { family, id } of pendingItemsInScope(handles, label, byId)) {
-      const handle = handles[family];
-      if (!handle) continue;
-      const entry = QUARANTINE_LABELS.has(label.label)
-        ? { kind: "quarantined", item_id: id, reason: "label", label_id: label.id }
-        : (ADMISSIBLE_LABELS.has(label.label) ? { kind: "label_marked", item_id: id, label_id: label.id, label: label.label } : null);
-      if (!entry) continue;
-      try {
-        await appendPendingEntries(descartesPaths, handle, [entry], { now: ts, restrictiveOnly: true });
-        journalEffects.push({ family, item_id: id, kind: entry.kind });
-      } catch {
-        journalEffects.push({ family, item_id: id, kind: "failed" });
-      }
-    }
+    const journalEffects = [...pendingEffects.entries()].flatMap(([family, effects]) => effects.map(({ id, entry }) => ({ family, item_id: id, kind: entry.kind })));
     state.ingested[label.id] = { ingested_at: ts, charge, label: label.label };
+    failedById.delete(label.id);
     const summary = {
       id: label.id,
       label: label.label,
@@ -403,6 +438,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
     }
   }
   state.held = stillHeld;
+  state.failed = [...failedById.values()].slice(-MAX_LABEL_RETRIES * 256);
   // Remember ingested ids for the label memory; the label log is what proves a label existed.
   for (const [id, entry] of Object.entries(state.ingested)) {
     if (nowMs - Date.parse(entry.ingested_at) > LABEL_MEMORY_MS) delete state.ingested[id];
