@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   defaultNotificationChannel,
+  drainDueNotificationOutbox,
   deliverNotificationDecision,
   normalizeNotificationPayload,
   queuePendingNotification,
@@ -91,6 +92,51 @@ test("required_disabled_notice_stays_pending_until a later daemon retry", async 
   assert.equal(state.notices[0].last_status, "disabled");
 });
 
+test("daemon due-notice drain retries retained notices, including synthetic integrity summaries", async () => {
+  const paths = await tempPaths();
+  const now = "2026-05-29T00:02:00.000Z";
+  const { pendingFile, configFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, JSON.stringify({
+    v: 2,
+    notices: [
+      {
+        id: "integrity.notification_outbox:corrupt",
+        digest: "a".repeat(64),
+        rule_id: "integrity.notification_outbox",
+        first_seen_at: "2026-05-29T00:00:00.000Z",
+        severity: "critical",
+        title: "Descartes: required notification outbox corrupt",
+        body: "The required notification outbox was corrupt.",
+        attempts: 0,
+        last_status: null,
+        corruption: "malformed JSON",
+      },
+      {
+        id: "integrity.notification_outbox:overflow",
+        digest: "b".repeat(64),
+        rule_id: "integrity.notification_outbox",
+        first_seen_at: "2026-05-29T00:00:00.000Z",
+        severity: "critical",
+        title: "Descartes: required notification outbox overflowed",
+        body: "Required notification outbox overflowed; 3 unresolved notices are represented by this counted summary.",
+        attempts: 0,
+        last_status: null,
+        notices_overflowed: 3,
+      },
+    ],
+  }));
+  await fs.mkdir(path.dirname(configFile), { recursive: true });
+  await writeNotificationDeliveryConfig(paths, { enabled: true, channel: "cli" }, { now });
+
+  const drained = await drainDueNotificationOutbox(paths, { now });
+
+  assert.equal(drained.attempted, 2);
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.pending.length, 0);
+  assert.ok(state.notices.every((notice) => notice.last_status === "cli_only"));
+});
+
 test("required_unavailable_notice_stays_pending", async () => {
   const paths = await tempPaths();
   const record = await deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
@@ -142,6 +188,43 @@ test("notification outbox overflow keeps a counted summary instead of silently e
   assert.equal(state.pending.some((entry) => entry.id === "notice:0"), true);
   assert.equal(summary.notices_overflowed, 2, "the displaced unresolved notice and the new one are both counted");
   assert.match(summary.body, /2/);
+});
+
+test("aggregating into a delivered overflow summary resets its delivery state and digest", async () => {
+  const paths = await tempPaths();
+  for (let index = 0; index < 513; index += 1) {
+    await queuePendingNotification(paths, { notify: true, title: `Notice ${index}`, body: "Pending" }, {
+      now: "2026-05-29T00:00:00.000Z",
+      required: true,
+      requiredNoticeId: `notice:summary:${index}`,
+      ruleId: "integrity.test",
+    });
+  }
+  const before = await readPendingNotifications(paths);
+  const summaryBefore = before.notices.find((entry) => entry.rule_id === "integrity.notification_outbox");
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.writeFile(pendingFile, JSON.stringify({
+    v: 2,
+    notices: before.notices.map((entry) => entry.id === summaryBefore.id
+      ? { ...entry, notices_overflowed: 1, last_status: "delivered", delivered_at: "2026-05-29T00:01:00.000Z" }
+      : entry),
+  }));
+
+  await queuePendingNotification(paths, { notify: true, title: "Another notice", body: "Pending" }, {
+    now: "2026-05-29T00:02:00.000Z",
+    required: true,
+    requiredNoticeId: "notice:summary:513",
+    ruleId: "integrity.test",
+  });
+
+  const after = await readPendingNotifications(paths);
+  const summaryAfter = after.notices.find((entry) => entry.id === summaryBefore.id);
+  assert.equal(summaryAfter.notices_overflowed, 2);
+  assert.equal(summaryAfter.last_status, null);
+  assert.equal(summaryAfter.delivered_at, undefined);
+  assert.notEqual(summaryAfter.digest, summaryBefore.digest);
+  assert.ok(summaryAfter.summary_version > (summaryBefore.summary_version ?? 0));
+  assert.ok(after.pending.some((entry) => entry.id === summaryAfter.id));
 });
 
 test("corrupt notification outbox is surfaced read-only; daemon recovery owns quarantine", async () => {

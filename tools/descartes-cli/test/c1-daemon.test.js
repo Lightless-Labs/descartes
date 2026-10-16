@@ -10,7 +10,7 @@ import { runDaemonIteration } from "../src/daemon.js";
 import { readAlertRecords } from "../src/alert-store.js";
 import { readAlertTransitions } from "../src/alert-transitions.js";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { resolveNotificationDeliveryPaths } from "../src/notification-delivery.js";
+import { deliverNotificationDecision, readPendingNotifications, resolveNotificationDeliveryPaths, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-c1-daemon-test-"));
@@ -73,6 +73,36 @@ test("an unreadable notification outbox leaves the tick warning and the path unc
   assert.equal(result.notificationOutbox.error.code, "EISDIR");
   assert.equal(result.status.state, "error");
   assert.equal((await fs.stat(pendingFile)).isDirectory(), true);
+});
+
+test("the daemon retries a due required notice on the next tick after its channel is enabled", async () => {
+  const paths = await tempPaths();
+  const firstAttempt = "2026-10-12T00:00:00.000Z";
+  const retryAt = "2026-10-12T00:02:00.000Z";
+  const initial = await deliverNotificationDecision(paths, {
+    notify: true,
+    severity: "warning",
+    title: "Epoch notice",
+    body: "The journal entered a new epoch.",
+  }, {
+    now: firstAttempt,
+    required: true,
+    requiredNoticeId: "epoch:notice",
+    ruleId: "integrity.pending_discontinuity",
+  });
+  assert.equal(initial.status, "disabled");
+  await writeNotificationDeliveryConfig(paths, { enabled: true, channel: "cli" }, { now: retryAt });
+
+  const result = await runDaemonIteration(paths, {
+    collectors: collectorsWithMemory(0.1),
+    ts: retryAt,
+    now: retryAt,
+  });
+
+  const state = await readPendingNotifications(paths);
+  assert.equal(result.notificationOutbox.drained, 1);
+  assert.equal(state.pending.length, 0);
+  assert.equal(state.notices.find((entry) => entry.id === "epoch:notice").last_status, "cli_only");
 });
 
 test("closure integrity audit is recorded before a delivery exception", async () => {
