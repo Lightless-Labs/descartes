@@ -642,3 +642,46 @@ test("seen and resolved entries must carry a well-formed resolution", async () =
     assert.equal((await readPendingNotifications(paths)).tamper?.kind, "notification_outbox_corrupt", JSON.stringify(body));
   }
 });
+
+test("two writers racing past the same stale lock both land, and no lock is left behind", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(`${pendingFile}.lock`, JSON.stringify({ pid: 2 ** 22 + 12345, at: new Date().toISOString() }));
+  await Promise.all(["a", "b", "c"].map((suffix) => queuePendingNotification(paths, { notify: true, title: `Racer ${suffix}`, body: "Body" }, {
+    now: "2026-05-29T00:11:00.000Z", requiredNoticeId: `notice:racer:${suffix}`, ruleId: "integrity.test",
+  })));
+  assert.deepEqual((await readPendingNotifications(paths)).pending.map((entry) => entry.id).sort(), ["notice:racer:a", "notice:racer:b", "notice:racer:c"]);
+  const names = await fs.readdir(path.dirname(pendingFile));
+  assert.equal(names.some((name) => name.includes(".lock")), false, names.join(","));
+  assert.equal(names.some((name) => name.includes(".corrupt-")), false);
+});
+
+test("a live holder's lock is never broken just because a waiter waited", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  const lockFile = `${pendingFile}.lock`;
+  const held = JSON.stringify({ pid: process.pid, token: "held", at: new Date().toISOString() });
+  await fs.writeFile(lockFile, held);
+  let landed = false;
+  const queued = queuePendingNotification(paths, { notify: true, title: "Waiter", body: "Body" }, { now: "2026-05-29T00:12:00.000Z", requiredNoticeId: "notice:waiter", ruleId: "integrity.test" }).then(() => { landed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(landed, false);
+  assert.equal(await fs.readFile(lockFile, "utf8"), held);
+  await fs.unlink(lockFile);
+  await queued;
+  assert.deepEqual((await readPendingNotifications(paths)).pending.map((entry) => entry.id), ["notice:waiter"]);
+});
+
+test("viewing with ids marks only the rendered notices seen", async () => {
+  const paths = await tempPaths();
+  for (const id of ["notice:rendered", "notice:queued-after-render"]) {
+    await queuePendingNotification(paths, { notify: true, title: id, body: "Body" }, { now: "2026-05-29T00:13:00.000Z", requiredNoticeId: id, ruleId: "integrity.test" });
+  }
+  const viewed = await viewPendingNotifications(paths, { now: "2026-05-29T00:14:00.000Z", ids: ["notice:rendered"] });
+  assert.deepEqual(viewed.map((entry) => entry.id), ["notice:rendered"]);
+  const state = await readPendingNotifications(paths);
+  assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:queued-after-render"]);
+  assert.deepEqual(state.seen.map((entry) => entry.id), ["notice:rendered"]);
+});

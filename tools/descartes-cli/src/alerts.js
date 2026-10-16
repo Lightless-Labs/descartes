@@ -354,7 +354,8 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     const digest = await (runtime.buildAlertDigest ?? buildAlertDigest)(descartesPaths, { now: runtime.now });
     if (options.json) output(JSON.stringify({ digest }, null, 2));
     else output(renderAlertDigest(digest));
-    await viewPendingNotifications(descartesPaths, { now: runtime.now });
+    // Only the notices this digest showed become seen; one queued since stays pending.
+    await viewPendingNotifications(descartesPaths, { now: runtime.now, ids: filterNotificationEntries(digest.notifications?.pending, "pending").entries.map((notice) => notice.id) });
     return;
   }
 
@@ -379,7 +380,8 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     const renderOptions = { ...options, pendingNotifications };
     if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, renderOptions), notification_due_ids: result.notification_due_ids }, null, 2));
     else output(renderAlertList(result.alerts, renderOptions));
-    await viewPendingNotifications(descartesPaths, { now: runtime.now });
+    // Only the notices this view rendered become seen; one queued since stays pending.
+    await viewPendingNotifications(descartesPaths, { now: runtime.now, ids: filterNotificationEntries(pendingNotifications, "pending").entries.map((notice) => notice.id) });
   };
 
   if (options.subcommand === "list") {
