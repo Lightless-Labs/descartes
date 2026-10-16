@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-10-16
 
-## C1 daybreak gate 3–5 follow-ups — 2026-10-16 — local, not pushed
+## C1 daybreak gate 3–6 follow-ups — 2026-10-16 — local, not pushed
 
 Gate 3 (1 BLOCKER, 1 MEDIUM) and gate 4 (1 BLOCKER, 1 MEDIUM) closed on
 `feat/c1-alert-foundations-2026-10`: `0e61a19` (malformed outbox entries ⇒ corrupt ⇒ quarantine +
@@ -14,7 +14,7 @@ lost-update in the first stale-break design, fixed by the lock rewrite; the re-r
 lease preempting a live paused holder — live holders are now never broken, pid reuse is detected via
 `ps`, and blocked waiters fail loudly after 120 s). Lock contract and its same-UID
 scoping: addendum in `docs/plans/2026-10-12-c1-alert-evidence-boundary.md`. Fresh-XDG full
-`npm test`: **2,813 tests: 2,772 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 5
+`npm test`: **2,818 tests: 2,777 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 6
 confirmation, then merge to local main, then C1a. No push.
 
 ## C1 alert evidence-boundary rework — 2026-10-12 — local, not pushed
