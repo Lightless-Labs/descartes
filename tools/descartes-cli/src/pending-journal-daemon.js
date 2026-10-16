@@ -59,7 +59,10 @@ export async function deliverPendingDiscontinuityNotice(descartesPaths, { family
     }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID, required: true, requiredNoticeId: `${PENDING_DISCONTINUITY_NOTICE_ID}:${family}:${cause}` });
     return notificationOutcome(result);
   } catch (error) {
-    return { notified: false, notify_status: "error", notify_error: errorMessage(error) };
+    // The required notice may never have reached the outbox (e.g. a bounded lock wait failed): this
+    // is the one place it is known, so it is warned here and carried into the tick summary.
+    console.warn(`descartes: pending journal (${family}) discontinuity notice failed and may not be queued (${errorMessage(error)}); the digest still lists the open epoch`);
+    return { notified: false, notify_status: "error", notify_error: errorMessage(error), notify_queued: false };
   }
 }
 
@@ -141,6 +144,7 @@ export async function finishPendingJournalTick(descartesPaths, prePass, { ts, al
         admission: outcome.admission,
         open_epoch: result.handle.state.open_epoch,
         ...(result.report.discontinuity ? { discontinuity: result.report.discontinuity } : {}),
+        ...Object.fromEntries(["notified", "notify_status", "notify_error", "notify_queued"].filter((key) => result.report[key] !== undefined).map((key) => [key, result.report[key]])),
       };
     } catch (error) {
       summary[family] = { status: "error", error: errorMessage(error), admission: pendingAdmissionStatus(result.handle.state, ts) };

@@ -532,7 +532,7 @@ test("the pre-pass reads the carried witness: a wipe after transition-log compac
 
 // Adversarial review L2: the pre-pass runs before detection, so it never waits on a notification;
 // the discontinuity notice is delivered after detection, and an error status is not "notified".
-import { deliverPendingJournalNotices } from "../src/pending-journal-daemon.js";
+import { deliverPendingJournalNotices, finishPendingJournalTick } from "../src/pending-journal-daemon.js";
 
 test("the pre-pass never delivers; discontinuity notices go out after detection and an error status is not notified", async () => {
   const paths = await tempPaths();
@@ -551,6 +551,24 @@ test("the pre-pass never delivers; discontinuity notices go out after detection 
   const delivered = await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => ({ status: "delivered" }) });
   assert.equal(delivered.length, 1);
   assert.equal(prePass.families.session.report.notified, true);
+});
+
+test("a discontinuity notice that cannot even be queued is loud: warned and carried into the tick summary", async (t) => {
+  const paths = await tempPaths();
+  const structuralFacts = (passId) => ({ families: { session: { written_count: 3, retention: { pass_id: passId, pass_time_ms: T0 + passId * HOUR } } } });
+  await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(1), ts: iso(1), families: ["session"] });
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await fs.writeFile(journalFile, "{not json\n{}\n");
+  const prePass = await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(2), ts: iso(2), families: ["session"] });
+  const warn = t.mock.method(console, "warn", () => {});
+  await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => { throw new Error("notification outbox lock held by live pid 1"); } });
+  assert.equal(prePass.families.session.report.notified, false);
+  assert.equal(prePass.families.session.report.notify_queued, false);
+  assert.ok(warn.mock.calls.some((call) => /discontinuity notice failed and may not be queued/.test(String(call.arguments[0]))));
+  const summary = await finishPendingJournalTick(paths, prePass, { ts: iso(2), alertsPersisted: true });
+  assert.equal(summary.session.notified, false);
+  assert.equal(summary.session.notify_status, "error");
+  assert.match(summary.session.notify_error, /outbox lock/);
 });
 
 // Adversarial review L4: at a chain-level loss, the label log's quarantining labels are consulted, so a
