@@ -15,6 +15,8 @@ export const MAX_RETAINED_NOTIFICATION_NOTICES = 50;
 export const NOTIFICATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const NOTIFICATION_RETRY_BASE_MS = 60_000;
 export const NOTIFICATION_RETRY_CAP_MS = 60 * 60 * 1000;
+export const MAX_QUARANTINED_NOTIFICATION_OUTBOX_ARCHIVES = 10;
+export const NOTIFICATION_OUTBOX_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID = "integrity.notification_outbox";
 const NOTIFICATION_OUTBOX_OVERFLOW_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:overflow`;
 const NOTIFICATION_OUTBOX_CORRUPT_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:corrupt`;
@@ -320,6 +322,46 @@ async function ensureParent(file) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
 }
 
+function isQuarantinedNotificationOutboxArchive(name) {
+  return name.startsWith("notification-pending.json.corrupt-");
+}
+
+async function pruneQuarantinedNotificationOutboxArchives(descartesPaths, now) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const alertsDir = path.dirname(pendingFile);
+  let entries;
+  try {
+    entries = await fs.readdir(alertsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return 0;
+    throw error;
+  }
+  const archives = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !isQuarantinedNotificationOutboxArchive(entry.name)) continue;
+    const file = path.join(alertsDir, entry.name);
+    try {
+      const stat = await fs.stat(file);
+      archives.push({ file, mtimeMs: stat.mtimeMs });
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  const cutoffMs = Date.parse(now) - NOTIFICATION_OUTBOX_ARCHIVE_RETENTION_MS;
+  archives.sort((left, right) => right.mtimeMs - left.mtimeMs || right.file.localeCompare(left.file));
+  const toRemove = archives.filter((archive, index) => index >= MAX_QUARANTINED_NOTIFICATION_OUTBOX_ARCHIVES || archive.mtimeMs < cutoffMs);
+  let removed = 0;
+  for (const archive of toRemove) {
+    try {
+      await fs.unlink(archive.file);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return removed;
+}
+
 function noticeDelivered(entry) {
   return entry?.last_status === "delivered" || entry?.last_status === "cli_only";
 }
@@ -413,7 +455,8 @@ export function selectNotificationNoticeWindow(state, { now = new Date().toISOSt
 export async function retainNotificationOutbox(descartesPaths, { now = new Date().toISOString() } = {}) {
   const normalizedNow = normalizeIso(now, "now");
   const state = await recoverNotificationOutbox(descartesPaths);
-  if (state.outbox_error) return { status: "warning", outbox_error: state.outbox_error };
+  const removedArchives = await pruneQuarantinedNotificationOutboxArchives(descartesPaths, normalizedNow);
+  if (state.outbox_error) return { status: "warning", outbox_error: state.outbox_error, removed_archives: removedArchives };
   const nowMs = Date.parse(normalizedNow);
   const cutoffMs = nowMs - NOTIFICATION_RETENTION_MS;
   const summary = state.notices.find((entry) => entry.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
@@ -435,7 +478,7 @@ export async function retainNotificationOutbox(descartesPaths, { now = new Date(
     const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
     await writePendingState(pendingFile, { notices }, normalizedNow);
   }
-  return { status: "ok", retained: kept.length, dropped: droppedCount, overflowed: nextSummary?.notices_overflowed ?? 0 };
+  return { status: "ok", retained: kept.length, dropped: droppedCount, overflowed: nextSummary?.notices_overflowed ?? 0, removed_archives: removedArchives };
 }
 
 function normalizeIso(ts, field = "timestamp") {

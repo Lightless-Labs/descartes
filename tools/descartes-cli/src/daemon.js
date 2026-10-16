@@ -1206,6 +1206,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         ...(retention.status === "warning" ? { error: retention.outbox_error } : {}),
         ...(drain.status === "warning" ? { error: drain.error ?? { message: "one or more due notices failed" } } : {}),
         ...(retention.dropped > 0 ? { dropped: retention.dropped, overflowed: retention.overflowed } : {}),
+        removed_archives: retention.removed_archives ?? 0,
         drained: drain.attempted,
         delivered: drain.delivered,
         failed: drain.failed,

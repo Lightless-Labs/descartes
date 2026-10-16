@@ -193,6 +193,7 @@ export function digestSummaryLine(digest) {
 export function renderAlertDigest(digest) {
   const lines = [`Descartes digest ${digest.period.since} .. ${digest.period.until}`];
   if (digest.empty) {
+    if (digest.notifications?.warning) lines.push(`- WARNING: notification outbox could not be read (${digest.notifications.warning.message}); the daemon left it unchanged and will retry.`);
     lines.push("Nothing changed state and nothing is open.");
     return lines.join("\n");
   }

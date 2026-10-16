@@ -149,6 +149,10 @@ export function visibleAlerts(alerts, options = {}) {
 
 function renderPendingNotices(lines, notificationState, now) {
   // Rendering is always read-only. Delivery status is independent of whether an operator has viewed the row.
+  if (notificationState?.outbox_error) {
+    const warning = notificationState.outbox_error;
+    lines.push(`WARNING: notification outbox could not be read (${warning.code ?? "unknown"}: ${warning.message ?? "unknown error"}); the daemon left it unchanged and will retry.`);
+  }
   const view = selectNotificationNoticeWindow(notificationState, { now });
   const rawEntries = Array.isArray(notificationState) ? notificationState : notificationState?.notices;
   const skipped = filterNotificationEntries(rawEntries).skipped;
