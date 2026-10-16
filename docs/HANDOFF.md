@@ -1,6 +1,18 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-16
+
+## C1 daybreak gate 3–5 follow-ups — 2026-10-16 — local, not pushed
+
+Gate 3 (1 BLOCKER, 1 MEDIUM) and gate 4 (1 BLOCKER, 1 MEDIUM) closed on
+`feat/c1-alert-foundations-2026-10`: `0e61a19` (malformed outbox entries ⇒ corrupt ⇒ quarantine +
+fresh outbox; list/JSON/digest render only well-formed notices), `7905d16` (incremental transition
+verification survives compaction via the cut header's recorded predecessor head), `0936f47` +
+`5b09bf9` (cooperative outbox lock around every read-modify-write; recovery re-reads under the lock;
+atomic stale-lock claim; list/digest mark seen only rendered ids). Lock contract and its same-UID
+scoping: addendum in `docs/plans/2026-10-12-c1-alert-evidence-boundary.md`. Fresh-XDG full
+`npm test`: **2,813 tests: 2,772 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 5
+confirmation, then merge to local main, then C1a. No push.
 
 ## C1 alert evidence-boundary rework — 2026-10-12 — local, not pushed
 

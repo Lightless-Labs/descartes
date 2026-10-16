@@ -1,7 +1,7 @@
 # C1 alert evidence-boundary rework
 
 **Status:** complete
-**Last updated:** 2026-10-12 — implementation and full-suite verification complete
+**Last updated:** 2026-10-16 — gate 3–4 follow-ups (addendum below)
 
 ## Scope
 
@@ -26,6 +26,32 @@ closure witnesses fail closed and re-notify, label journal-open failures abort t
 required notices are queued before optional configuration is read, audit records precede delivery,
 outbox overflow/corruption stays visible, discarded storm keys above the delivered storm severity
 escalate, and closure reconciliation reuses the verified transition head.
+
+## Addendum: daybreak gates 3–4 follow-ups (2026-10-16)
+
+**Addendum:** 2026-10-16 — gate 3 (BLOCKER: structurally malformed outbox entries bypassed
+corruption handling; MEDIUM: incremental transition verification fell back to `full_recovery` on
+every tick after compaction) and gate 4 (BLOCKER: recovery compare-then-rename could quarantine a
+valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are closed:
+
+- `0e61a19` — every pending/seen/resolved entry is shape-validated; any malformed entry makes the
+  outbox corrupt (quarantined, fresh valid outbox with a pending integrity notice). Alert list, JSON,
+  digest build/render render only well-formed notices and count the rest; queue normalizes inputs so
+  the module never writes what its validator rejects.
+- `7905d16` — the incremental verifier accepts a compacted log: the cut header's recorded
+  predecessor head (`through_seq`/`through_hash`) must be cited by the first kept record, and the
+  header (carried witness, coverage, projection digest) is returned. The whole-file content digest in
+  the state file still binds the unverified prefix, header included.
+- `0936f47`, `5b09bf9` — **outbox lock contract:** one lock file `<pendingFile>.lock`, created with
+  `wx`, JSON `{pid, token, at}`; every outbox read-modify-write (queue, settle, view, attempt
+  bookkeeping, corruption recovery) runs under it; recovery re-reads under the lock before
+  quarantining; release unlinks only the holder's own token. A lock is stale when its holder pid is
+  dead, it is unreadable for >2 s, or it is older than 30 s (never because a waiter waited); a stale
+  lock is broken by claiming it with a rename, restoring a displaced fresh lock. `alerts list`/`digest`
+  mark seen only the notice ids they rendered.
+
+The lock is **cooperative**: a same-UID writer that ignores it can still race or rewrite the outbox.
+That is the same deliberate same-UID forgery already out of scope above, not a new boundary.
 
 ## Atomic slices
 
