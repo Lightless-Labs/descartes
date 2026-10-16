@@ -784,7 +784,7 @@ test("default profile's structural block is inert without the watch.json kill sw
   // every statusRecord, this fast path included.
   assert.deepEqual(
     Object.keys(result.status).sort(),
-    ["collector_statuses", "integrity_level", "mode", "points_written", "profile", "retention", "state", "ts"].sort(),
+    ["collector_statuses", "integrity_level", "mode", "notification_outbox", "points_written", "profile", "retention", "state", "ts"].sort(),
   );
 
   await assert.rejects(() => fs.access(resolveStructuralCheckpointPath(paths)));
