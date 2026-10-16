@@ -5,13 +5,18 @@ import {
   writeAlertIntelligenceConfig,
 } from "./alert-intelligence.js";
 import { acknowledgeAlert, evaluateAlerts, fixedAlertIds, readAlertRecords } from "./alert-store.js";
+import { appendAlertLabel } from "./alert-labels.js";
+import { buildAlertDigest, renderAlertDigest } from "./alert-digest.js";
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
+  filterNotificationEntries,
   notificationDeliveryResolution,
   notificationPlatformNotes,
   readNotificationDeliveryConfig,
   testNotificationDelivery,
+  readPendingNotifications,
+  selectNotificationNoticeWindow,
   writeNotificationDeliveryConfig,
 } from "./notification-delivery.js";
 
@@ -20,6 +25,9 @@ function alertsUsage() {
   descartes alerts list [--json] [--all]
   descartes alerts watch [--json] [--interval <duration>] [--once] [--all]
   descartes alerts ack <alert-id> [--json]
+  descartes alerts label <alert-id> <label> [--incident <key>]... [--json]
+  descartes alerts label <label> --family <family> --from <iso> --to <iso> [--json]
+  descartes alerts digest [--json]
   descartes alerts intelligence status [--json]
   descartes alerts intelligence enable [--json] [--model <MODEL>] [--thinking <LEVEL>] [--max-per-hour <N>]
   descartes alerts intelligence disable [--json]
@@ -31,6 +39,10 @@ function alertsUsage() {
   descartes alerts notifications disable [--json]
 
 Lists and acknowledges deterministic local alerts without invoking an LLM.
+Labels (benign, suspicious, expected, mine, confirmed_incident, missed_incident) are OPTIONAL: they
+only accelerate or correct learning, and nothing depends on them. The daemon ingests each label once,
+charges what it covers to a weekly label budget, notifies it, and never lets it cancel an undelivered
+notification.
 Alert intelligence is explicit opt-in; when enabled, deterministic alert transitions may wake an LLM to decide whether/how to notify.
 Alert intelligence is further gated per-namespace: only alert families in enabled_namespaces (default: metric only) may wake the LLM, even when alert intelligence itself is enabled. Use enable-namespace/disable-namespace to opt individual families in or out; "learned" self-audit findings can never be enabled.
 Notification delivery is separately opt-in and only sends bounded LLM-authored notification text.`;
@@ -39,8 +51,8 @@ Notification delivery is separately opt-in and only sends bounded LLM-authored n
 function parseAlertsArgs(args) {
   const [subcommand, ...rest] = args;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") return { subcommand: "help" };
-  if (!["list", "watch", "ack", "intelligence", "notifications"].includes(subcommand)) throw new Error(`Unsupported alerts command: ${subcommand}\n\n${alertsUsage()}`);
-  const options = { subcommand, json: false, all: false, intervalMs: 5000, once: false };
+  if (!["list", "watch", "ack", "label", "digest", "intelligence", "notifications"].includes(subcommand)) throw new Error(`Unsupported alerts command: ${subcommand}\n\n${alertsUsage()}`);
+  const options = { subcommand, json: false, all: false, intervalMs: 5000, once: false, labelPositionals: [], incidentKeys: [] };
   if (subcommand === "intelligence") {
     options.intelligenceCommand = rest.shift() ?? "status";
     if (!["status", "enable", "disable", "enable-namespace", "disable-namespace"].includes(options.intelligenceCommand)) throw new Error(`Unsupported alerts intelligence command: ${options.intelligenceCommand}\n\n${alertsUsage()}`);
@@ -86,6 +98,14 @@ function parseAlertsArgs(args) {
       index += 1;
     } else if (arg === "--help" || arg === "-h") {
       options.help = true;
+    } else if (subcommand === "label" && ["--incident", "--family", "--from", "--to"].includes(arg)) {
+      const value = rest[index + 1];
+      if (!value) throw new Error(`${arg} requires a value`);
+      if (arg === "--incident") options.incidentKeys.push(value);
+      else options[arg.slice(2)] = value;
+      index += 1;
+    } else if (subcommand === "label" && options.labelPositionals.length < 2) {
+      options.labelPositionals.push(arg);
     } else if (subcommand === "ack" && !options.alertId) {
       options.alertId = arg;
     } else if (subcommand === "intelligence" && ["enable-namespace", "disable-namespace"].includes(options.intelligenceCommand) && !options.namespaceArg) {
@@ -95,6 +115,11 @@ function parseAlertsArgs(args) {
     }
   }
   if (subcommand === "ack" && !options.alertId && !options.help) throw new Error(`alerts ack requires an alert id\n\n${alertsUsage()}`);
+  if (subcommand === "label" && !options.help) {
+    const windowed = options.family !== undefined || options.from !== undefined || options.to !== undefined;
+    if (windowed && (options.labelPositionals.length !== 1 || !options.family || !options.from || !options.to || options.incidentKeys.length > 0)) throw new Error(`alerts label over a pending window needs <label> --family --from --to\n\n${alertsUsage()}`);
+    if (!windowed && options.labelPositionals.length !== 2) throw new Error(`alerts label requires an alert id and a label\n\n${alertsUsage()}`);
+  }
   if (subcommand === "intelligence" && ["enable-namespace", "disable-namespace"].includes(options.intelligenceCommand) && !options.namespaceArg && !options.help) throw new Error(`alerts intelligence ${options.intelligenceCommand} requires a namespace\n\n${alertsUsage()}`);
   if (subcommand !== "watch" && options.once) throw new Error(`--once is only supported for alerts watch\n\n${alertsUsage()}`);
   if (subcommand !== "intelligence" && (options.modelPattern || options.thinkingLevel || options.maxCallsPerHour !== undefined)) throw new Error(`Alert intelligence options require 'descartes alerts intelligence enable'\n\n${alertsUsage()}`);
@@ -122,10 +147,29 @@ export function visibleAlerts(alerts, options = {}) {
   return sortAlerts(alerts.filter((alert) => options.all || activeStatuses.has(alert.status)));
 }
 
+function renderPendingNotices(lines, notificationState, now) {
+  // Rendering is always read-only. Delivery status is independent of whether an operator has viewed the row.
+  if (notificationState?.outbox_error) {
+    const warning = notificationState.outbox_error;
+    lines.push(`WARNING: notification outbox could not be read (${warning.code ?? "unknown"}: ${warning.message ?? "unknown error"}); the daemon left it unchanged and will retry.`);
+  }
+  const view = selectNotificationNoticeWindow(notificationState, { now });
+  const rawEntries = Array.isArray(notificationState) ? notificationState : notificationState?.notices;
+  const skipped = filterNotificationEntries(rawEntries).skipped;
+  const pending = view.entries.filter((notice) => !["delivered", "cli_only", "skipped"].includes(notice.last_status));
+  if (view.entries.length > 0) {
+    if (pending.length > 0) lines.push(`Required notices pending: ${pending.length}`);
+    for (const notice of view.entries) lines.push(`- required notice: ${notice.title} [${notice.last_status ?? "pending"}; ${notice.digest.slice(0, 16)}]`);
+  }
+  if (view.older_count > 0) lines.push(`Required notices older/overflowed: ${view.older_count}`);
+  if (skipped > 0) lines.push(`Required notices skipped: ${skipped} (malformed outbox entr${skipped === 1 ? "y" : "ies"})`);
+}
+
 export function renderAlertList(alerts, options = {}) {
   const shown = visibleAlerts(alerts, options);
-  if (shown.length === 0) return options.all ? "No alert records." : "No active alerts.";
-  const lines = [`Alerts (${shown.length}${options.all ? " total" : " active"})`];
+  const lines = shown.length === 0
+    ? [options.all ? "No alert records." : "No active alerts."]
+    : [`Alerts (${shown.length}${options.all ? " total" : " active"})`];
   for (const alert of shown) {
     lines.push(`- ${alert.id} [${alert.severity}/${alert.status}] ${alert.title}`);
     if (alert.summary) lines.push(`  ${alert.summary}`);
@@ -133,11 +177,20 @@ export function renderAlertList(alerts, options = {}) {
     if (alert.acknowledged_at) lines.push(`  acknowledged_at=${alert.acknowledged_at}`);
     if (alert.delivery_failure_count > 0) lines.push(`  delivery= failing since ${alert.delivery_failing_since ?? alert.last_delivery_failure_at ?? "unknown"} (next attempt ${alert.next_attempt_at ?? "now"}; ${alert.delivery_failure_count} failure${alert.delivery_failure_count === 1 ? "" : "s"}${alert.delivery_failure_reason ? `: ${alert.delivery_failure_reason}` : ""})`);
   }
+  renderPendingNotices(lines, options.notificationState ?? { notices: options.pendingNotifications }, options.now);
   return lines.join("\n");
 }
 
 function jsonAlertPayload(alerts, options = {}) {
-  return { alerts: visibleAlerts(alerts, options) };
+  const state = options.notificationState ?? { notices: options.pendingNotifications };
+  const view = selectNotificationNoticeWindow(state, { now: options.now });
+  const pending = view.entries.filter((notice) => !["delivered", "cli_only", "skipped"].includes(notice.last_status));
+  return {
+    alerts: visibleAlerts(alerts, options),
+    required_notifications: view.entries,
+    required_notifications_older_count: view.older_count,
+    pending_notifications: pending,
+  };
 }
 
 // S13 nice-to-have: surface enabled_namespaces + critical_reservation + a corrupt-config marker,
@@ -295,6 +348,30 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     return;
   }
 
+  if (options.subcommand === "label") {
+    const windowed = options.family !== undefined;
+    const label = windowed ? options.labelPositionals[0] : options.labelPositionals[1];
+    const scope = windowed
+      ? { kind: "pending_window", family: options.family, from_ts: options.from, to_ts: options.to }
+      : { kind: "alert", alert_id: options.labelPositionals[0], ...(options.incidentKeys.length > 0 ? { incident_keys: options.incidentKeys } : {}) };
+    if (!windowed) {
+      const known = (await readAlertRecords(descartesPaths)).some((alert) => alert.id === scope.alert_id);
+      if (!known) throw new Error(`Alert not found: ${scope.alert_id}`);
+    }
+    const record = await (runtime.appendAlertLabel ?? appendAlertLabel)(descartesPaths, { label, scope });
+    if (options.json) output(JSON.stringify({ label: record }, null, 2));
+    else output(`Recorded label ${record.label} (${record.id}); the daemon applies it on its next tick, charged to the weekly label budget and notified. Labels are optional.`);
+    return;
+  }
+
+  if (options.subcommand === "digest") {
+    // Read-only: the digest since the last pushed period (the daemon pushes it once per period).
+    const digest = await (runtime.buildAlertDigest ?? buildAlertDigest)(descartesPaths, { now: runtime.now });
+    if (options.json) output(JSON.stringify({ digest }, null, 2));
+    else output(renderAlertDigest(digest));
+    return;
+  }
+
   if (options.subcommand === "ack") {
     const alert = await acknowledgeAlert(descartesPaths, options.alertId);
     if (options.json) output(JSON.stringify({ alert }, null, 2));
@@ -312,8 +389,10 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     // (recovery + episode/last_notified) remains exclusively the daemon's job via
     // evaluateAndPersistAlerts with the full extraCandidates set.
     const result = await evaluateAlerts(descartesPaths, { coveredAlertIds: fixedAlertIds() });
-    if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, options), notification_due_ids: result.notification_due_ids }, null, 2));
-    else output(renderAlertList(result.alerts, options));
+    const notificationState = await readPendingNotifications(descartesPaths);
+    const renderOptions = { ...options, notificationState, now: runtime.now };
+    if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, renderOptions), notification_due_ids: result.notification_due_ids, ...(notificationState.outbox_error ? { notification_outbox_warning: notificationState.outbox_error } : {}) }, null, 2));
+    else output(renderAlertList(result.alerts, renderOptions));
   };
 
   if (options.subcommand === "list") {

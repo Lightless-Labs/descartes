@@ -422,6 +422,8 @@ test("sanitization: only hashes/counts/enums surface -- a raw diagnostics field 
     "rule_id_family",
     "fired_count",
     "fired_count_is_lower_bound",
+    // C1.2: closed enum ("transitions" | "snapshot"), never a raw value.
+    "fired_count_source",
     "auto_recovered_fast_count",
     "never_escalated_count",
     "llm_adjudicated_count",

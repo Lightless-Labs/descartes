@@ -79,6 +79,52 @@ test("alerts list evaluates local history and prints active alerts", async () =>
   assert.match(outputs[0], /disk/i);
 });
 
+test("alerts list renders present alerts and reports a malformed outbox without quarantining it", async () => {
+  const paths = await tempPaths();
+  const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 2, notices: [null] }));
+
+  const outputs = [];
+  await runAlerts(paths, ["list"], { output: (line) => outputs.push(line), now: "2026-05-29T00:00:00.000Z" });
+
+  // The evaluated (present) alerts render in full; the corrupt outbox only adds its integrity notice.
+  assert.match(outputs[0], /^Alerts \(\d+ active\)/);
+  assert.match(outputs[0], /\[warning\/active\] No recent metric samples/);
+  assert.match(outputs[0], /Required notices pending: 1/);
+  assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false);
+  const state = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+  assert.equal(state.notices.length, 1, "the CLI never writes the corrupt outbox");
+  await assert.rejects(fs.access(path.join(paths.stateDir, "alerts", "notification-seen.jsonl")));
+});
+
+test("plain-text alerts list visibly warns when the notification outbox cannot be read", async () => {
+  const paths = await tempPaths();
+  const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.mkdir(pendingFile);
+
+  const outputs = [];
+  await runAlerts(paths, ["list"], { output: (line) => outputs.push(line), now: "2026-05-29T00:00:00.000Z" });
+
+  assert.match(outputs[0], /WARNING: notification outbox could not be read \(EISDIR/);
+});
+
+test("alert list renderer skips odd pending notices and counts them without hiding alerts", () => {
+  const output = renderAlertList([{
+    id: "alert_present",
+    status: "active",
+    severity: "warning",
+    title: "Present alert",
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T00:00:00.000Z",
+  }], { now: "2026-05-28T01:00:00.000Z", pendingNotifications: [null, { id: "notice", title: "Notice", digest: "a".repeat(64), rule_id: "integrity.test", first_seen_at: "2026-05-28T00:00:00.000Z", severity: "warning", body: "Body", attempts: 0, last_status: null }, { title: 7 }] });
+  assert.match(output, /alert_present/);
+  assert.match(output, /Required notices pending: 1/);
+  assert.match(output, /required notice: Notice/);
+  assert.match(output, /Required notices skipped: 2/);
+});
+
 test("alerts list is read-only: never recovers an active alert from a detector family it did not evaluate", async () => {
   const paths = await tempPaths();
   const [seeded] = await writeAlertRecords(paths, [{

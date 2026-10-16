@@ -5,7 +5,12 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
+import { readVerifiedAlertTransitions, reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
+import { maybeSendAlertDigest } from "./alert-digest.js";
+import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
+import { deliverNotificationDecision, drainDueNotificationOutbox, recoverNotificationOutbox, retainNotificationOutbox } from "./notification-delivery.js";
+import { deliverPendingDiscontinuityNotice, deliverPendingJournalNotices, finishPendingJournalTick, notificationOutcome, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
+import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID, writeAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
@@ -1183,6 +1188,32 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  let notificationOutbox;
+  let notificationOutboxCanDrain = false;
+  const notificationRouteBreakers = new Set();
+  let initialStatusWriteFailed = false;
+  try {
+    const recovered = await recoverNotificationOutbox(descartesPaths);
+    if (recovered.outbox_error) {
+      notificationOutbox = { status: "warning", error: recovered.outbox_error, changed: false };
+    } else {
+      const retention = await retainNotificationOutbox(descartesPaths, { now: ts });
+      notificationOutboxCanDrain = true;
+      notificationOutbox = {
+        status: recovered.recovered || retention.status === "warning" ? "warning" : "ok",
+        ...(recovered.recovered ? { recovery: "corrupt_outbox_quarantined" } : {}),
+        ...(retention.status === "warning" ? { error: retention.outbox_error } : {}),
+        ...(retention.dropped > 0 ? { dropped: retention.dropped, overflowed: retention.overflowed } : {}),
+        removed_archives: retention.removed_archives ?? 0,
+        drained: 0,
+        delivered: 0,
+        failed: 0,
+      };
+    }
+  } catch (error) {
+    notificationOutbox = { status: "warning", error: error instanceof Error ? error.message : String(error), changed: false };
+    console.warn(`[daemon] notification outbox maintenance failed (${notificationOutbox.error}); it remains unchanged`);
+  }
   try {
     await fs.unlink(path.join(descartesPaths.stateDir, "daemon", LEGACY_CONTENT_PIN_FILE));
   } catch (error) {
@@ -1315,6 +1346,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // safeCandidates -- see its doc comment above) so a genuine structural-fact append failure can
   // feed this tick's own status.state/storage_write_error below.
   let structuralFactPersistError;
+  // Context plan C1.4: per-family pending-journal handles opened after this tick's fact commit.
+  let pendingJournalPrePass;
   let shadowEvaluation;
   let contextKeyStatus;
   let bootLedgerError;
@@ -1569,6 +1602,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
             console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
             structuralFacts = { written_count: 0, retention: undefined };
+          }
+
+          // Context plan C1.4 (item 16, I69, I54): after the commit and BEFORE detection, map each
+          // journaled family's committed pass to its observation time, journal unmapped/unscored
+          // passes as excluded ranges, detect discontinuities and re-certify. Foundation only: it
+          // never changes detection, and a failure here is reported, never fatal to the tick.
+          try {
+            pendingJournalPrePass = await (options.runPendingJournalPrePass ?? runPendingJournalPrePass)(descartesPaths, { structuralFacts, ts });
+          } catch (error) {
+            pendingJournalPrePass = undefined;
+            console.warn(`descartes: pending journal pre-pass failed (${error instanceof Error ? error.message : String(error)}); detection is unaffected`);
           }
 
           // C2-only families are a second, explicit pass. Their outcome is carried on context_c2 and
@@ -2095,7 +2139,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const retentionError = combineErrors(write.retention_error, structuralFacts?.retention_error);
   const statusRecord = {
     ts,
-    state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure ? "error" : "ok",
+    state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure || notificationOutbox?.status === "warning" ? "error" : "ok",
     mode: options.mode ?? "foreground",
     profile,
     collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),
@@ -2115,6 +2159,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(factStoreDeprecations.length > 0 ? { fact_store_deprecations: factStoreDeprecations } : {}),
     ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
     ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
+    ...(notificationOutbox ? { notification_outbox: notificationOutbox } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
     // property, so it is unconditional here (unlike the ...(x ? {...} : {}) spreads above, which
     // are conditional on genuinely-computed-this-tick evidence). Display/disclosure only -- see
@@ -2139,6 +2184,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       state: "error",
       storage_write_error: combineErrors(statusRecord.storage_write_error, message),
     };
+    initialStatusWriteFailed = true;
   }
   // Regression fix (sol re-review of the 7.2 re-phasing): computing the detector candidates
   // MUTATES detector stores (baseline folds, credential/lineage advances), so it must NOT run
@@ -2418,10 +2464,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     const finalAlertsById = new Map((containmentAlerts.alerts ?? []).map((alert) => [alert.id, alert]));
     const dueEntryStillApplies = (entry) => {
       const finalAlert = finalAlertsById.get(entry.alert_id);
-      if (!finalAlert || ["recovered", "suppressed"].includes(finalAlert.status)) return false;
+      if (!finalAlert || isUndeliverableStatus(finalAlert.status)) return false;
       if (entry.storm) return finalAlert.incident_state === "incident_storm";
       const incident = finalAlert.incidents?.[entry.incident_key];
-      return Boolean(incident && !["recovered", "suppressed"].includes(incident.status));
+      return Boolean(incident && !isUndeliverableStatus(incident.status));
     };
     alerts = {
       ...containmentAlerts,
@@ -2478,6 +2524,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           deliverSessionAlerts: options.deliverSessionAlerts,
           deliverMetricAlertFallback: options.deliverMetricAlertFallback,
           adjudicateAlerts: options.adjudicateAlerts,
+          routeBreakers: notificationRouteBreakers,
         }),
         undefined,
       )
@@ -2487,7 +2534,190 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     : delivered?.metricAlertFallback
       ?? (alertIntelligenceConfig?.enabled && options.deliverMetricAlertFallback !== false ? { fired: [], skipped: "intelligence_enabled" } : undefined);
   const alertIntelligence = delivered?.alertIntelligence;
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
+  // Context plan C1.1 (§9): the daemon -- the transition log's only writer -- diffs the persisted
+  // alert store against the log's projection after every write of this tick (detection, delivery
+  // outcomes) and appends the transitions. Audit only: a failure here never affects alerting.
+  // Context plan C1.3 (§9, I27, I62): the daemon ingests the CLI's optional labels once each, by id,
+  // after this tick's delivery outcomes (so a closure applies at once to a just-delivered incident and
+  // waits for delivery otherwise), charges coverage to the label budget, and notifies the batch.
+  // Review L2: the pre-pass's discontinuity notices go out here, after detection and delivery, so a
+  // slow or failing notification channel never delays detection.
+  if (pendingJournalPrePass) {
+    try {
+      await deliverPendingJournalNotices(descartesPaths, pendingJournalPrePass, { ts, deliverNotification: options.deliverNotification });
+    } catch (error) {
+      console.warn(`descartes: pending journal notice failed (${error instanceof Error ? error.message : String(error)}); detection is unaffected`);
+    }
+  }
+  let labelIngestion;
+  let verifiedTransitionLog;
+  if (alerts) {
+    try {
+      verifiedTransitionLog = await readVerifiedAlertTransitions(descartesPaths);
+    } catch {
+      verifiedTransitionLog = undefined;
+    }
+    try {
+      const handles = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).filter(([, result]) => result.handle).map(([family, result]) => [family, result.handle]));
+      const ledgers = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).map(([family, result]) => [family, result.ledger ?? null]));
+      labelIngestion = await (options.ingestAlertLabels ?? ingestAlertLabels)(descartesPaths, { now: ts, handles, ledgers, transitionLog: verifiedTransitionLog });
+      for (const { family, epoch, cause } of labelIngestion?.discontinuities ?? []) {
+        await deliverPendingDiscontinuityNotice(descartesPaths, { family, epoch, cause, ts, deliverNotification: options.deliverNotification });
+      }
+      if (labelIngestion?.notice) {
+        try {
+          const labelNoticeId = `${LABEL_NOTICE_RULE_ID}:${[...(labelIngestion.ingested ?? []).map((entry) => entry.id), ...(labelIngestion.held ?? []).map((entry) => entry.id)].sort().join(",")}`;
+          const outcome = notificationOutcome(await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID, required: true, requiredNoticeId: labelNoticeId }));
+          if (!outcome.notified) labelIngestion.notify_error = outcome.notify_error;
+        } catch (error) {
+          labelIngestion.notify_error = error instanceof Error ? error.message : String(error);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      labelIngestion = { status: "error", error: message, audit: [] };
+      console.warn(`descartes: label ingestion failed (${message}); alerting is unaffected`);
+    }
+  }
+  let alertTransitions;
+  let closureReconciliation;
+  let authorizedClosures = [];
+  let labelAuthorizedClosures = [];
+  if (alerts || pendingJournalPrePass) {
+    try {
+      const deliveryOutcomes = [
+        ...(delivered?.sessionAlertDelivery?.delivery_outcomes ?? []),
+        ...(delivered?.metricAlertFallback?.delivery_outcomes ?? []),
+        ...(delivered?.alertIntelligence?.delivery_outcomes ?? []),
+      ];
+      const currentAlertsForWitness = await readAlertRecords(descartesPaths);
+      authorizedClosures = deliveryOutcomes
+        .filter((outcome) => {
+          if (outcome.status !== "success") return false;
+          const alert = currentAlertsForWitness.find((entry) => entry.id === outcome.alertId);
+          const incident = alert?.incidents?.[outcome.incidentKey];
+          return incident?.status === "closed" && incident.closed_reason === "event_delivered" && incident.close_on_delivery === true;
+        })
+        .map((outcome) => ({ kind: "closure_authorized", alert_id: outcome.alertId, incident_key: outcome.incidentKey, reason: "event_delivered" }));
+      labelAuthorizedClosures = (labelIngestion?.audit ?? []).filter((record) => record.kind === "closure_authorized");
+      closureReconciliation = await (options.reconcileAlertClosures ?? reconcileAlertClosures)(descartesPaths, { now: ts, authorizedClosures: [...authorizedClosures, ...labelAuthorizedClosures], verifiedLog: verifiedTransitionLog });
+      if (closureReconciliation.changes.length > 0) await writeAlertRecords(descartesPaths, closureReconciliation.alerts);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      alertTransitions = { status: "error", error: message };
+      console.warn(`descartes: alert transition log write failed (${message}); alerting is unaffected`);
+    }
+    if (closureReconciliation) {
+      const extraRecords = [
+        ...pendingJournalAuditRecords(pendingJournalPrePass),
+        ...(labelIngestion?.audit ?? []),
+        ...authorizedClosures,
+        ...closureReconciliation.audit,
+      ];
+      try {
+        // Audit records are committed before their required notices are delivered. A malformed
+        // notification config or adapter exception must never erase the durable evidence of the
+        // unattributed change that caused the notice.
+        alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, {
+          now: ts,
+          extraRecords,
+          verifiedLog: closureReconciliation.transitionLog,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        alertTransitions = { status: "error", error: message };
+        console.warn(`descartes: alert transition log write failed (${message}); alerting is unaffected`);
+      }
+      for (const [index, notice] of (closureReconciliation.notices ?? []).entries()) {
+        try {
+          await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, notice, {
+            now: ts,
+            ruleId: "integrity.unattributed_change",
+            required: true,
+            requiredNoticeId: `integrity.unattributed_change:${closureReconciliation.changes[index].digest}`,
+          });
+        } catch (error) {
+          console.warn(`descartes: closure integrity notice failed (${error instanceof Error ? error.message : String(error)}); it remains pending`);
+        }
+      }
+    }
+  }
+  // C1.4 write order (§6.4.2): journal entries, then alerts.json and the transition log, then the
+  // scored-through watermark. A family is scored only if the alert store persisted and none of its
+  // detectors failed; otherwise its pass stays unscored and is excluded(unadjudicated) next tick.
+  // Context plan C1.5 (I75): the digest, once per period when not empty, outside any attention budget.
+  let alertDigest;
+  if (alerts) {
+    try {
+      alertDigest = await (options.maybeSendAlertDigest ?? maybeSendAlertDigest)(descartesPaths, { now: ts, deliverNotification: options.deliverNotification ?? deliverNotificationDecision });
+    } catch (error) {
+      alertDigest = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  // Required-notice retries are deliberately last in the tick: collection, detection, and alert
+  // delivery must not wait behind a slow adapter. They share alert delivery's route circuit, so one
+  // adapter failure/unavailability costs at most one attempt for that route and the skipped notices
+  // receive their normal backoff instead of being made to disappear.
+  if (notificationOutboxCanDrain) {
+    try {
+      const drain = await drainDueNotificationOutbox(descartesPaths, {
+        now: ts,
+        routeBreakers: notificationRouteBreakers,
+        ...(options.deliverNotification ? { deliverNotification: options.deliverNotification } : {}),
+        ...(options.notificationDeliveryOptions ?? {}),
+      });
+      notificationOutbox = {
+        ...notificationOutbox,
+        status: notificationOutbox.status === "warning" || drain.status === "warning" ? "warning" : "ok",
+        ...(drain.status === "warning" ? { error: drain.error ?? { message: "one or more due notices failed" } } : {}),
+        drained: drain.attempted,
+        delivered: drain.delivered,
+        failed: drain.failed,
+        ...(drain.skipped > 0 ? { skipped: drain.skipped } : {}),
+      };
+    } catch (error) {
+      notificationOutbox = {
+        ...notificationOutbox,
+        status: "warning",
+        error: error instanceof Error ? error.message : String(error),
+      };
+      console.warn(`[daemon] notification outbox drain failed (${notificationOutbox.error}); it remains unchanged`);
+    }
+    // The first status write intentionally precedes detection. Refresh it after the deferred drain
+    // so the durable tick status contains the final outbox counters without moving adapter work
+    // back in front of collection or detection.
+    const finalStatus = {
+      ...status,
+      state: notificationOutbox.status === "warning" ? "error" : status.state,
+      notification_outbox: notificationOutbox,
+    };
+    if (initialStatusWriteFailed) {
+      // Preserve the first write failure verbatim. Retrying a known-failing seam here would turn
+      // one honest error into duplicated storage_write_error text and would not create durable state.
+      status = { ...status, notification_outbox: notificationOutbox };
+    } else {
+      try {
+        status = await persistStatus(descartesPaths, finalStatus);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[daemon] final notification outbox status write failed this tick (${message})`);
+        status = { ...finalStatus, state: "error", storage_write_error: combineErrors(finalStatus.storage_write_error, message) };
+      }
+    }
+  }
+  let pendingJournal;
+  if (pendingJournalPrePass) {
+    try {
+      pendingJournal = await finishPendingJournalTick(descartesPaths, pendingJournalPrePass, {
+        ts,
+        alertsPersisted: Boolean(mainAlerts) && !alertPersistenceError,
+        failedDetectorLabels,
+      });
+    } catch (error) {
+      pendingJournal = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion, alertDigest, notificationOutbox };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

@@ -360,6 +360,7 @@ test("status shape: the top-level keys of a clean watch-tier tick's status recor
     "fact_store_completeness",
     "integrity_level",
     "mode",
+    "notification_outbox",
     "novelty_seen_sets",
     "points_written",
     "profile",

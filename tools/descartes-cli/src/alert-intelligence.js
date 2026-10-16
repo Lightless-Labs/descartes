@@ -3,13 +3,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures, recordAlertDeliveryOutcomes } from "./alert-store.js";
+import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, isUndeliverableStatus, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures, recordAlertDeliveryOutcomes } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
 import { SCHEDULED_JOB_APPEARED_RULE_ID } from "./persistence-baseline.js";
 import { CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
+import { NOTIFICATION_ADAPTER_ROUTE } from "./notification-delivery.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -223,13 +224,13 @@ async function deliveryStillDue(descartesPaths, alert, now, incidentKey = incide
   // The daemon path always has one; only a persisted record can prove that a stale evaluation was
   // already delivered.
   if (!current) return true;
-  if (["recovered", "suppressed"].includes(current.status)) return false;
+  if (isUndeliverableStatus(current.status)) return false;
   if (incidentKey === INCIDENT_STORM_KEY) {
     if (current.incident_storm_notified_at) return false;
     return deliveryStillDueForFields(current, now);
   }
   const incident = current.incidents?.[incidentKey];
-  if (!incident) return false;
+  if (!incident || isUndeliverableStatus(incident.status)) return false;
   const currentRank = alertSeverityRank(incident.severity_max);
   const notifiedRank = alertSeverityRank(incident.notified_severity);
   if (incident.confirmed_at && currentRank <= notifiedRank) return false;
@@ -1224,7 +1225,7 @@ export async function deliverDueAlertNotifications(descartesPaths, evaluation, o
     metric: { fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
     llm: { status: config.enabled ? "no_due_alerts" : "disabled", fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
   };
-  const breakers = new Set();
+  const breakers = options.routeBreakers ?? new Set();
   const emitSession = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
   const emitMetric = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
@@ -1263,11 +1264,15 @@ export async function deliverDueAlertNotifications(descartesPaths, evaluation, o
       target.failed.push(item.alert.id);
       target.route_failed = true;
       breakers.add(item.route);
+      if (item.route === "session" || item.route === "metric") breakers.add(NOTIFICATION_ADAPTER_ROUTE);
       continue;
     }
     appendRouteResult(target, result);
     deliveryOutcomes.push(...(result?.delivery_outcomes ?? []));
-    if (target.route_failed) breakers.add(item.route);
+    if (target.route_failed) {
+      breakers.add(item.route);
+      if (item.route === "session" || item.route === "metric") breakers.add(NOTIFICATION_ADAPTER_ROUTE);
+    }
   }
 
   if (deliveryOutcomes.length > 0 && descartesPaths?.stateDir) {

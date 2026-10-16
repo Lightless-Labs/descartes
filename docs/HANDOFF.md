@@ -1,6 +1,146 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-16
+
+## C1 due-notice drain phasing and route circuit — 2026-10-16 — local, not pushed
+
+Moved retained due-notice draining to the end of the daemon tick, after collection, detection,
+alert delivery, transition work, and digest handling. The drain shares alert delivery's per-tick
+adapter route breaker: the first failure/unavailability opens the route, later retained notices
+receive normal retry backoff without another adapter attempt, and collection/detection cannot be
+delayed by the retained-notice backlog. Added a regression with 50 slow failing due notices that
+observes collection first and one adapter attempt. Fixed the stale pending-journal retry comment.
+
+TDD commits: `2a1d5f3` (red ordering/circuit regression), `9626926` (deferred drain, shared route
+breaker, stale comment), and `3b054ac` (preserve the first daemon status write failure during the
+deferred status refresh). Focused verification passes **199/199**, plus the targeted status-write
+regression **1/1**.
+
+Fresh-XDG full `npm test`: **2,821 tests: 2,758 pass, 22 fail, 0 cancelled, 35 skipped, 6 todo**.
+The 22 failures are environment-only: 17 notifier-reuse and 3 tap-bump loopback test-server
+cases fail with sandbox `listen EPERM`, and 2 live-process provenance checks return `unknown`
+under restricted process introspection. A fresh-XDG baseline before these changes had **0
+cancelled** tests, so no cancelled test was introduced by this branch change and none was available
+to repair. No push or merge.
+
+## C1 due-notice drain and outbox retention follow-ups — 2026-10-16 — local, not pushed
+
+Closed the daybreak B1/B2, MEDIUM 1/2, and LOW findings in atomic commits:
+`fc9d402` (red regressions), `582efab` (daemon-owned due-notice drain), `599cf5d`
+(overflow-summary version/digest and delivery-state reset), `b45ad94` (archive and warning
+regressions), `ea9107f` (bounded quarantine archives, daemon removal count, and plain-text warnings),
+and `75490a3` (plan whitespace). The drain runs during every daemon maintenance pass, retries every
+due retained notice through the normal delivery path, and records outcomes for injected delivery
+seams as well; integrity corruption and overflow summaries are covered. Overflow aggregation now
+increments `summary_version`, changes the digest, clears delivery/backoff fields, and makes the
+summary due again. Quarantined outbox archives retain only the newest ten within 30 days, with
+removed counts in `notification_outbox` status. List and digest text expose unreadable-outbox
+warnings, including an otherwise empty digest.
+
+Affected-area verification passes **77/77**. Fresh-XDG full `npm test` reports **2,820 tests: 2,757
+pass, 22 fail, 35 skipped, 6 todo**. The 22 failures are environment-only: 17 notifier-reuse and
+3 tap-bump loopback test-server cases fail with sandbox `listen EPERM`, and 2 live-process
+provenance checks return `unknown` under restricted process introspection. No changed-area product
+test failed. No push or merge.
+
+## C1 retained required-notice semantics — 2026-10-16 — local, not pushed
+
+Replaced the viewing/seen mechanism with a daemon-owned retained notice collection. Required
+delivery outcomes stay attached to each notice; disabled/unavailable outcomes remain due with
+backoff. `alerts list` and `alerts digest` render a read-only newest-50/30-day window plus an
+older/overflow count, and never write notice state. Daemon-only retention removes notices by time
+and count. Discontinuity notice IDs now include the journal epoch.
+
+Outbox reads distinguish filesystem errors from parse/schema corruption. EACCES/EIO/EISDIR-style
+errors abort outbox work without mutation and appear as an integrity warning in tick status.
+Malformed JSON/schema is quarantined only by the daemon, with valid embedded notices salvaged into
+the fresh outbox.
+
+TDD commits are `65de1fb` (red tests), `22dcbe1` (implementation), and `946354d` (status-shape
+regression contract). Focused verification passes **106/106** across notification delivery,
+alerts, digest, pending journal, and C1 daemon integration; the affected daemon/fact-store status
+suite passes **207/207**. Full fresh-XDG `npm test` ran with **2,813 tests: 2,748 pass, 24 fail,
+35 skipped, 6 todo**. Two failures were the intentional `notification_outbox` status-shape
+contract and are fixed by `946354d`; the remaining 22 are environment-only: 17 notifier-reuse
+and 3 tap-bump loopback tests fail with sandbox `listen EPERM`, and 2 live-process provenance
+checks return `unknown` under restricted process introspection. No push or merge.
+
+## C1 daybreak gate 3–6 follow-ups — 2026-10-16 — historical lock notes, superseded locally
+
+Gate 3 (1 BLOCKER, 1 MEDIUM) and gate 4 (1 BLOCKER, 1 MEDIUM) closed on
+`feat/c1-alert-foundations-2026-10`: `0e61a19` (malformed outbox entries ⇒ corrupt ⇒ quarantine +
+fresh outbox; list/JSON/digest render only well-formed notices), `7905d16` (incremental transition
+verification survives compaction via the cut header's recorded predecessor head), `0936f47` +
+`5b09bf9` (cooperative outbox lock around every read-modify-write; recovery re-reads under the lock;
+serialized, content-verified lock removal; historical list/digest viewing-state behavior is
+superseded by the retained-notice semantics above; round 5 found a
+lost-update in the first stale-break design, fixed by the lock rewrite; the re-run found the 30 s
+lease preempting a live paused holder — live holders are now never broken, pid reuse is detected via
+`ps`, and blocked waiters fail loudly after 120 s; round 6 found release waiting on the break lock
+(fixed: release never waits) and a silently unqueued discontinuity notice (fixed: warned + carried
+into the tick summary) — those two fixes are NOT yet re-gated). Lock contract and its same-UID
+scoping: addendum in `docs/plans/2026-10-12-c1-alert-evidence-boundary.md`. Fresh-XDG full
+`npm test`: **2,820 tests: 2,779 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 7 confirmation of `1af5828` + `07005d4` (gate-round budget for this cycle was exhausted at round 6)
+confirmation, then merge to local main, then C1a. No push.
+
+The cooperative lock contract described in this historical section was removed by the
+single-writer replacement above; the non-lock fixes listed here remain part of the current
+implementation.
+
+## C1 alert evidence-boundary rework — 2026-10-12 — local, not pushed
+
+Closed the daybreak B1-B5, HIGH 1-3, and MEDIUM 1-2 findings in six atomic commits:
+`8c83f62` (daemon closure attribution and restoration), `3124231` (witness-derived label budget
+and transactional label application), `daeca16` (fail-closed pending-journal recovery, bounded
+checkpoint state and hostile reads), `32a0624` (required notification outbox, CLI visibility and
+overflow severity), `d641b83` (incremental transition verification and chain-sourced digest
+attribution), and `5ff8931` (daemon label/delivery closure witness authorization and visible retry
+failures). Same-UID writes remain `unprotected_same_uid`; they are now detected, hash-chained, and
+surfaced rather than treated as authoritative. Notifications remain optional: disabled/unavailable
+required notices stay pending until delivery; viewing never changes notice state.
+
+Focused C1 verification passes **all changed-area tests: 26/26** in the final daemon/label run; the
+earlier slices also passed their focused suites (transitions 18/18, labels 18/18, pending journal
+34/34, notification delivery 24/24, alerts 15/15, closure regressions 17/17, and digest 7/7).
+Fresh-XDG full `npm test` reports **2,789 total: 2,726 passed, 22 failed, 35 skipped, 6 todo**.
+The 22 failures are environment-only: 17 notifier-reuse and 3 tap-bump loopback test-server cases
+fail with `listen EPERM`, and 2 live-process provenance checks return `unknown` under restricted
+process introspection. No changed-area product test failed. No push or merge.
+
+## C1 adversarial review fixes — 2026-10-12 — local, not pushed
+
+The C1 adversarial review at 9e2ff10 (NEEDS-REWORK: 1 BLOCKER, 2 HIGH, 5 MEDIUM, 6 LOW) is fully addressed on
+`feat/c1-alert-foundations-2026-10`, test-first, one atomic commit per fix (`d149a4d`..`cc2a64e`). Key changes:
+a covered absence now recovers a closed alert, so a whole-alert label can never silence later recurrences
+(B1); storm exit makes every undelivered, uncovered incident due (H2); each pending-journal checkpoint chains
+its state digest (`checkpointed`), so a checkpoint is never an authority (H1); restart records verify only as
+a chain's first record (M5); epochs and ranges carry across chain-level loss (M2); the transition log carries
+a witness (journal creations, epochs, ingested labels) through compaction, restarts and its state file, read
+by the pre-pass and label ingestion (M3, M1); `edge_rearm` is never a fast recovery (M4); plus L1-L6 (created
+journals exist on disk, notices after detection, escalation clears closure requests, label-log quarantines
+re-applied at a discontinuity, labels bound to their episode, truncation and projection binding in the
+transition log). Dispositions: "C1 review fixes (2026-10-12)" in the plan. Fresh-XDG full `npm test`:
+**2,776 tests: 2,735 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** re-review / daybreak gate of C1, then
+merge, then C1a (which must wire the §6.4.2 transition-log/journal cross-check). No push or merge.
+
+## C1 alert foundations — 2026-10-12 — local, not pushed
+
+On `feat/c1-alert-foundations-2026-10` (worktree `.claude/worktrees/c1`, from local `main` @ 8dc00a7), plan
+step C1 of `docs/plans/2026-10-06-context-aware-learned-baselines.md` is built as foundations only, in six
+atomic commits: `284a946` `closed(reason)` incident/alert status with delivery-gated closure, tombstones and
+storm exit/escalation (C1.1, item 19); `34931f3` the daemon-written hash-chained alert transition log
+(C1.1); `73db712` `fired_count` from `activated` transitions, fixing the verified tuning-loop collapse
+(C1.2); `7be24c8` the per-family pending journal with the durable pass map, scored-through watermark,
+certification at write and the discontinuity exit (C1.4, item 16); `8c792ed` the optional label log,
+daemon ingestion and coverage-charged label budget (C1.3, item 15); `45f9cd1` the daily digest (C1.5).
+Detection and what fires are unchanged; notify-once guarantees hold (storm changes only add
+notifications). See "Addendum: C1 execution (2026-10-12)" in the plan for deviations (checkpoint written
+after detection; no replay before C1a; discontinuity and label-burst are notices, not alert rules) and
+deferred items. Self-review fixes: `4798a18` (a storm never swallows an undelivered escalation) and a
+label-opened journal epoch that could never re-certify. Fresh-XDG full `npm test`: **2,748 tests: 2,707
+pass, 0 fail, 35 skipped, 6 todo**.
+**NEXT:** daybreak gate of C1 (alert-store closure/storm, pending journal, label ingestion), then merge,
+then C1a. No push or merge.
 
 ## Context facts C2b per-family rollback markers — 2026-10-11 — local, not pushed
 

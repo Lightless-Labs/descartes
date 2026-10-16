@@ -346,6 +346,18 @@ wall-clock expiry. Residual: under cap pressure after a clock rollback, a rollba
 may be considered oldest by filename. The audit reader merges legacy files, archives, and dated
 segments by record timestamp in stable chronological order.
 
+Required notices (label application, discontinuity, unattributed change, integrity, label bursts,
+and outbox overflow) have separate delivery semantics. The daemon records the delivery outcome on
+the notice itself; `disabled` and `unavailable` are not delivery and remain due for the existing
+exponential retry backoff. Delivery does not make a notice disappear. `descartes alerts list` and
+`descartes alerts digest` are read-only and always show the newest required notices in a bounded
+window (up to 50 notices from the last 30 days), plus a count of older or overflowed notices.
+Nothing is consumed or marked by viewing. Only the daemon ages notices out by the time and count
+retention bounds. Discontinuity notice IDs include their journal family and epoch, so a new epoch
+cannot collide with an older one. A filesystem read failure while opening the outbox is an
+integrity warning and leaves the file untouched; only parse/schema corruption is quarantined, with
+valid embedded notices salvaged into the replacement outbox.
+
 The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
 diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
 is:
@@ -516,6 +528,12 @@ These are the limits of the defensive layer today:
   ledger together defeats the on-host check. An off-host attestation and a fleet
   dead-man's-switch are future design work. A canary detects tampering, but it cannot
   protect itself against local root.
+- **Same-UID alert state has the same boundary.** A process running as Descartes' UID can
+  rewrite `alerts.json`, `labels.state.json`, required-notification state, and the chained
+  logs. C1 keeps cheap consistency checks and fails closed on ordinary read/write failures, but
+  it does not claim to prevent or reliably prove deliberate same-UID forgery (including forged
+  delivery timestamps, closure reuse, or pre-populated label state). That requires off-host
+  attestation as a separate initiative.
 - **Recommend-only.** Containment proposes an action. It never does the action. There is no
   general remediation tool yet.
 - **One instance only.** Two daemon instances on the same state directory can race the fact

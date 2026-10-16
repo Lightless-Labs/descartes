@@ -8,8 +8,72 @@ export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
 export const DELIVERY_BACKOFF_BASE_MS = 60_000;
 export const DELIVERY_BACKOFF_CAP_MS = 60 * 60 * 1000;
 export const MAX_LIVE_INCIDENTS = 256;
+export const MAX_OVERFLOW_SUMMARY = 1024;
 export const INCIDENT_STORM_KEY = "__incident_storm__";
 export const RETENTION_FAILURE_RULE_ID = "daemon.fact_store.retention_failing";
+
+// Context plan C1.1 (§6.0, §6.1, CC7, I63, I73). `closed(reason)` is a per-incident (and, once every
+// incident of a closure request is closed, an alert-level) status. It re-arms like `recovered`, but
+// unlike `recovered` it is not evidence that a condition cleared: it is bookkeeping. The closed
+// incident record stays in the incident map as its own tombstone, so a re-emitted closed key never
+// re-notifies at or below its closed severity, while a higher severity re-opens it and notifies.
+// A closure is applied only to a DELIVERED incident: a closure request on an undelivered or escalated
+// incident waits for delivery, so a closure can never cancel a notification or its retry.
+export const ALERT_CLOSURE_REASONS = Object.freeze([
+  "label",
+  "superseded",
+  "event_delivered",
+  "admitted_earned",
+  "admitted_unexplained",
+  "explained_context",
+  "replaced",
+]);
+const CLOSURE_REASON_SET = new Set(ALERT_CLOSURE_REASONS);
+const CLOSED_BY_KINDS = new Set(["label", "delivery", "producer", "promotion", "replacement", "context_model", "bounded_quiet"]);
+// §16.1 (S): incident tombstones kept per alert. Beyond it the oldest closed incidents are dropped and
+// counted in tombstones_dropped_total (a visible notice, listed by the digest).
+export const MAX_INCIDENT_TOMBSTONES = 4096;
+const ALERT_STATUSES = new Set(["active", "recovered", "acknowledged", "suppressed", "closed"]);
+// Statuses on which no notification is ever due.
+const UNDELIVERABLE_STATUSES = new Set(["recovered", "suppressed", "closed"]);
+// Statuses that do not count toward the live-incident cap.
+const NON_LIVE_INCIDENT_STATUSES = new Set(["acknowledged", "recovered", "suppressed", "closed"]);
+
+export function isUndeliverableStatus(status) {
+  return UNDELIVERABLE_STATUSES.has(status);
+}
+
+export function isLiveIncident(incident) {
+  return Boolean(incident) && !NON_LIVE_INCIDENT_STATUSES.has(incident.status);
+}
+
+const SAFE_REF = /^[A-Za-z0-9._:@+-]{1,128}$/;
+
+function normalizeClosedBy(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const kind = CLOSED_BY_KINDS.has(value.kind) ? value.kind : null;
+  if (!kind) return null;
+  const ref = typeof value.ref === "string" && SAFE_REF.test(value.ref) ? value.ref : null;
+  return { kind, ref };
+}
+
+function normalizeCloseRequest(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!CLOSURE_REASON_SET.has(value.reason)) return null;
+  const requestedAt = value.requested_at ? new Date(value.requested_at) : null;
+  if (!requestedAt || Number.isNaN(requestedAt.getTime())) return null;
+  return { reason: value.reason, requested_at: requestedAt.toISOString(), by: normalizeClosedBy(value.by) };
+}
+
+// A persisted `closed` status is honoured only with a valid reason and timestamp; anything else
+// normalizes to `active` (a malformed closure must never hide a live condition).
+function normalizeClosedFields(raw, statusField = "status") {
+  const closedAt = raw?.closed_at ? new Date(raw.closed_at) : null;
+  const valid = raw?.[statusField] === "closed" && CLOSURE_REASON_SET.has(raw.closed_reason) && closedAt && !Number.isNaN(closedAt.getTime());
+  return valid
+    ? { closed: true, closed_reason: raw.closed_reason, closed_at: closedAt.toISOString(), closed_by: normalizeClosedBy(raw.closed_by) }
+    : { closed: false, closed_reason: null, closed_at: null, closed_by: null };
+}
 
 // Retained as a compatibility export for the historical alert-config constraint and callers that
 // import the old symbol. Alert delivery no longer uses this value: episode state below is the only
@@ -279,7 +343,10 @@ export function normalizeAlertRecord(record) {
   const fingerprint = String(record.fingerprint ?? "global");
   const firstSeen = normalizeIso(record.first_seen ?? record.last_seen ?? new Date().toISOString(), "first_seen");
   const lastSeen = normalizeIso(record.last_seen ?? firstSeen, "last_seen");
-  const status = ["active", "recovered", "acknowledged", "suppressed"].includes(record.status) ? record.status : "active";
+  const alertClosure = normalizeClosedFields(record);
+  const status = record.status === "closed"
+    ? (alertClosure.closed ? "closed" : "active")
+    : (ALERT_STATUSES.has(record.status) ? record.status : "active");
   const lastNotified = record.last_notified ? normalizeIso(record.last_notified, "last_notified") : null;
   const episodeNotifiedAt = record.episode_notified_at ? normalizeIso(record.episode_notified_at, "episode_notified_at") : null;
   const normalizedCurrentIncidentKey = normalizeIncidentKey(record.current_incident_key ?? record.incident_key) ?? "default";
@@ -313,6 +380,9 @@ export function normalizeAlertRecord(record) {
     const topConfirmsCurrent = rawKey === normalizedCurrentIncidentKey && episodeNotifiedAt
       && (normalizeIncidentKeyList(record.notified_incident_keys).length === 0 || normalizeIncidentKeyList(record.notified_incident_keys).includes(rawKey));
     const notifiedSeverity = compatibilityNotifiedSeverity ?? rawIncident.notified_severity ?? rawIncident.notified_severity_max ?? (topConfirmsCurrent ? record.notified_severity_max : null);
+    const incidentClosure = normalizeClosedFields(rawIncident);
+    const stormCoveredAt = rawIncident.storm_covered_at ? new Date(rawIncident.storm_covered_at) : null;
+    const stormCovered = stormCoveredAt && !Number.isNaN(stormCoveredAt.getTime()) && typeof rawIncident.storm_covered_severity === "string";
     incidents[key] = {
       first_seen: incidentFirstSeen,
       last_seen: incidentLastSeen,
@@ -322,7 +392,18 @@ export function normalizeAlertRecord(record) {
       delivery_failure_count: Number.isInteger(rawIncident.delivery_failure_count) && rawIncident.delivery_failure_count > 0 ? rawIncident.delivery_failure_count : 0,
       next_attempt_at: compatibilityNextAttempt ? normalizeIso(compatibilityNextAttempt, "incident.next_attempt_at") : null,
       backoff_delay_ms: Number.isFinite(compatibilityBackoff) && compatibilityBackoff > 0 ? Math.min(compatibilityBackoff, DELIVERY_BACKOFF_CAP_MS) : null,
-      status: ["active", "recovered", "acknowledged", "suppressed"].includes(rawIncident.status) ? rawIncident.status : "active",
+      status: rawIncident.status === "closed"
+        ? (incidentClosure.closed ? "closed" : "active")
+        : (ALERT_STATUSES.has(rawIncident.status) ? rawIncident.status : "active"),
+      closed_reason: incidentClosure.closed_reason,
+      closed_at: incidentClosure.closed_at,
+      closed_by: incidentClosure.closed_by,
+      close_requested: incidentClosure.closed ? null : normalizeCloseRequest(rawIncident.close_requested),
+      close_on_delivery: rawIncident.close_on_delivery === true,
+      storm_covered_at: stormCovered ? stormCoveredAt.toISOString() : null,
+      storm_covered_severity: stormCovered ? String(rawIncident.storm_covered_severity) : null,
+      reopened_at: rawIncident.reopened_at ? normalizeIso(rawIncident.reopened_at, "incident.reopened_at") : null,
+      escalated_at: rawIncident.escalated_at ? normalizeIso(rawIncident.escalated_at, "incident.escalated_at") : null,
       last_attempt_at: compatibilityLastAttempt ? normalizeIso(compatibilityLastAttempt, "incident.last_attempt_at") : null,
       last_delivery_failure_at: rawIncident.last_delivery_failure_at ? normalizeIso(rawIncident.last_delivery_failure_at, "incident.last_delivery_failure_at") : null,
       delivery_failure_reason: rawIncident.delivery_failure_reason ? String(rawIncident.delivery_failure_reason) : null,
@@ -387,9 +468,25 @@ export function normalizeAlertRecord(record) {
     incident_state: incidentState,
     incident_storm_count: Number.isInteger(record.incident_storm_count) && record.incident_storm_count > 0 ? record.incident_storm_count : 0,
     incident_storm_notified_at: record.incident_storm_notified_at ? normalizeIso(record.incident_storm_notified_at, "incident_storm_notified_at") : null,
+    incident_storm_notified_severity: record.incident_storm_notified_severity ? String(record.incident_storm_notified_severity) : null,
     incident_storm_failure_count: Number.isInteger(record.incident_storm_failure_count) && record.incident_storm_failure_count > 0 ? record.incident_storm_failure_count : 0,
+    overflow_summary: Object.fromEntries(Object.entries(record.overflow_summary ?? {}).filter(([key, entry]) => normalizeIncidentKey(key) && entry && typeof entry === "object").slice(-MAX_OVERFLOW_SUMMARY).map(([key, entry]) => [key, {
+      severity_max: String(entry.severity_max ?? "warning"),
+      first_seen: entry.first_seen ? normalizeIso(entry.first_seen, "overflow.first_seen") : firstSeen,
+      last_seen: entry.last_seen ? normalizeIso(entry.last_seen, "overflow.last_seen") : lastSeen,
+    }])),
     legacy_without_episode: legacyWithoutEpisode,
     status,
+    // Same-UID state edits are outside prevention, but this marker is durable evidence that the
+    // daemon found and repaired one. It is intentionally not used to authorize any transition.
+    integrity_status: typeof record.integrity_status === "string" ? record.integrity_status : null,
+    integrity_digest: typeof record.integrity_digest === "string" ? record.integrity_digest : null,
+    integrity_at: record.integrity_at ? normalizeIso(record.integrity_at, "integrity_at") : null,
+    closed_reason: status === "closed" ? alertClosure.closed_reason : null,
+    closed_at: status === "closed" ? alertClosure.closed_at : null,
+    closed_by: status === "closed" ? alertClosure.closed_by : null,
+    close_requested: status === "closed" ? null : normalizeCloseRequest(record.close_requested),
+    tombstones_dropped_total: Number.isInteger(record.tombstones_dropped_total) && record.tombstones_dropped_total > 0 ? record.tombstones_dropped_total : 0,
     severity: record.severity === undefined || record.severity === null ? "warning" : String(record.severity),
     title: String(record.title ?? ruleId),
     summary: String(record.summary ?? ""),
@@ -516,8 +613,27 @@ function stableCandidate(left, right) {
   return leftText.localeCompare(rightText) <= 0 ? left : right;
 }
 
-function syncAlertProjection(alert) {
-  const keys = Object.keys(alert.incidents ?? {}).sort();
+// I73: the closed incidents of an alert are its tombstones. Bounded per alert: beyond the cap the
+// oldest closed incidents are dropped, oldest closure first, and counted (never silently).
+function boundIncidentTombstones(alert) {
+  const closed = Object.entries(alert.incidents ?? {}).filter(([, incident]) => incident?.status === "closed");
+  if (closed.length <= MAX_INCIDENT_TOMBSTONES) return alert;
+  const drop = closed
+    .sort(([leftKey, left], [rightKey, right]) => String(left.closed_at).localeCompare(String(right.closed_at)) || leftKey.localeCompare(rightKey))
+    .slice(0, closed.length - MAX_INCIDENT_TOMBSTONES)
+    .map(([key]) => key);
+  const incidents = { ...alert.incidents };
+  for (const key of drop) delete incidents[key];
+  return { ...alert, incidents, tombstones_dropped_total: (alert.tombstones_dropped_total ?? 0) + drop.length };
+}
+
+function syncAlertProjection(rawAlert) {
+  const alert = boundIncidentTombstones(rawAlert);
+  const allKeys = Object.keys(alert.incidents ?? {}).sort();
+  // A closed incident is history: it never masks a live incident as the projected current incident
+  // or raises the alert's projected severity. Only when every incident is closed does it project.
+  const openKeys = allKeys.filter((key) => alert.incidents[key]?.status !== "closed");
+  const keys = openKeys.length > 0 ? openKeys : allKeys;
   const preferredKey = keys.reduce((selected, key) => {
     if (!selected) return key;
     const selectedIncident = alert.incidents[selected];
@@ -529,6 +645,7 @@ function syncAlertProjection(alert) {
   }, undefined) ?? "default";
   const current = alert.incidents?.[preferredKey];
   const allIncidents = Object.values(alert.incidents ?? {});
+  const projectedIncidents = keys.map((key) => alert.incidents[key]);
   const confirmed = allIncidents.filter((incident) => incident.confirmed_at);
   const notified = [...new Set(confirmed.map((incident) => incident.notified_severity).filter(Boolean))]
     .sort((left, right) => alertSeverityRank(right) - alertSeverityRank(left));
@@ -538,9 +655,9 @@ function syncAlertProjection(alert) {
     ...alert,
     incident_key: preferredKey === "default" ? null : preferredKey,
     current_incident_key: preferredKey,
-    episode_incident_keys: keys,
-    notified_incident_keys: confirmed.map((incident) => keys.find((key) => alert.incidents[key] === incident)).filter(Boolean),
-    severity: allIncidents.reduce((max, incident) => incidentSeverityRank(incident) > alertSeverityRank(max) ? incident.severity_max : max, "info"),
+    episode_incident_keys: allKeys,
+    notified_incident_keys: confirmed.map((incident) => allKeys.find((key) => alert.incidents[key] === incident)).filter(Boolean),
+    severity: projectedIncidents.reduce((max, incident) => incidentSeverityRank(incident) > alertSeverityRank(max) ? incident.severity_max : max, "info"),
     title: payload.title ?? alert.title,
     summary: payload.summary ?? alert.summary,
     evidence_refs: payload.evidence_refs ?? alert.evidence_refs,
@@ -561,15 +678,140 @@ function syncAlertProjection(alert) {
     adjudicated_at: current?.adjudicated_at ?? null,
     adjudicated_episode_key: current?.adjudicated_at ? preferredKey : null,
     adjudication: current?.adjudication ?? null,
+    overflow_summary: alert.overflow_summary,
   });
 }
 
+// An incident is delivered once a notification at or above its current severity was confirmed:
+// individually, or (I63) by a confirmed incident-storm notification that covered it. A later
+// escalation makes it undelivered again until the escalation itself is delivered.
+export function incidentDelivered(incident) {
+  if (!incident) return false;
+  const rank = incidentSeverityRank(incident);
+  if (incident.confirmed_at && rank <= alertSeverityRank(incident.notified_severity)) return true;
+  return Boolean(incident.storm_covered_at && incident.storm_covered_severity && rank <= alertSeverityRank(incident.storm_covered_severity));
+}
+
+// An incident that was delivered once (individually or by a storm notification) and has since
+// escalated past what was delivered.
+// `escalated_at` marks an escalation of an existing incident, so an escalation that was never
+// delivered (e.g. its delivery failed inside a storm) stays individually due until it is.
+function escalationPending(incident) {
+  return Boolean(incident) && Boolean(incident.confirmed_at || incident.storm_covered_at || incident.escalated_at) && !incidentDelivered(incident)
+    && !isUndeliverableStatus(incident.status);
+}
+
 function notificationDueForIncident(alert, incident, { newIncident = false, severityEscalated = false, nowMs } = {}) {
-  if (!incident || ["suppressed", "recovered"].includes(alert.status) || ["suppressed", "recovered"].includes(incident.status)) return false;
+  if (!incident || isUndeliverableStatus(alert.status) || isUndeliverableStatus(incident.status)) return false;
   if (newIncident || severityEscalated) return true;
   if (alert.status === "acknowledged" && incident.status === "acknowledged") return false;
-  if (incident.confirmed_at && incidentSeverityRank(incident) <= alertSeverityRank(incident.notified_severity)) return false;
+  if (incidentDelivered(incident)) return false;
   return deliveryBackoffEligible({ last_attempt_at: incident.last_attempt_at, backoff_delay_ms: incident.backoff_delay_ms }, nowMs);
+}
+
+const CLOSE_REASON_BY_KIND = { event_delivered: "delivery" };
+
+function closeIncidentRecord(incident, reason, now, by) {
+  return {
+    ...incident,
+    status: "closed",
+    closed_reason: reason,
+    closed_at: now,
+    closed_by: normalizeClosedBy(by) ?? { kind: CLOSE_REASON_BY_KIND[reason] ?? "producer", ref: null },
+    close_requested: null,
+    next_attempt_at: null,
+    backoff_delay_ms: null,
+  };
+}
+
+// Applies every closure whose incident is now delivered: a producer-declared close-on-delivery
+// (I63, `event_delivered`) and any deferred closure request. Then settles an alert-level closure
+// request once none of its incidents is live. Pure.
+function settleAlertClosures(alert, now) {
+  let changed = false;
+  const incidents = { ...(alert.incidents ?? {}) };
+  for (const [key, incident] of Object.entries(incidents)) {
+    if (!incident || incident.status === "closed" || isUndeliverableStatus(incident.status)) continue;
+    if (!incidentDelivered(incident)) continue;
+    if (incident.close_requested) {
+      incidents[key] = closeIncidentRecord(incident, incident.close_requested.reason, now, incident.close_requested.by);
+      changed = true;
+    } else if (incident.close_on_delivery) {
+      incidents[key] = closeIncidentRecord(incident, "event_delivered", now, { kind: "delivery", ref: null });
+      changed = true;
+    }
+  }
+  let next = changed ? { ...alert, incidents } : alert;
+  if (next.close_requested && next.status !== "closed" && !isUndeliverableStatus(next.status)) {
+    const values = Object.values(next.incidents ?? {});
+    const anyOpen = values.some((incident) => incident && !isUndeliverableStatus(incident.status));
+    const anyClosedByRequest = values.some((incident) => incident?.status === "closed" && incident.closed_reason === next.close_requested.reason);
+    if (!anyOpen && anyClosedByRequest && next.incident_state !== "incident_storm") {
+      next = {
+        ...next,
+        status: "closed",
+        closed_reason: next.close_requested.reason,
+        closed_at: now,
+        closed_by: next.close_requested.by,
+        close_requested: null,
+      };
+      changed = true;
+    }
+  }
+  return changed ? syncAlertProjection(next) : alert;
+}
+
+/**
+ * Requests closure (CC7) of an alert's incidents with a reason. Each targeted incident that is
+ * already delivered closes now; an undelivered or escalated one records the request and closes only
+ * once it is delivered (a closure never cancels a notification or its retry). Recovered, suppressed
+ * and already-closed incidents are skipped. With `closeAlert`, the alert itself closes once none of
+ * its incidents is live. Pure: returns { alert, closed, deferred, skipped }.
+ */
+export function requestAlertClosure(alertRecord, { incidentKeys, reason, now, by, closeAlert = false } = {}) {
+  if (!CLOSURE_REASON_SET.has(reason)) throw new Error(`Unknown alert closure reason: ${reason}`);
+  const at = normalizeIso(now ?? new Date().toISOString(), "now");
+  const alert = normalizeAlertRecord(alertRecord);
+  const closedBy = normalizeClosedBy(by);
+  const targets = incidentKeys === undefined
+    ? Object.keys(alert.incidents ?? {})
+    : [...new Set(incidentKeys.map(normalizeIncidentKey).filter(Boolean))];
+  const result = { closed: [], deferred: [], skipped: [] };
+  if (isUndeliverableStatus(alert.status)) return { alert, ...result, skipped: targets };
+  const incidents = { ...alert.incidents };
+  for (const key of targets.sort()) {
+    const incident = incidents[key];
+    if (!incident || isUndeliverableStatus(incident.status)) {
+      result.skipped.push(key);
+      continue;
+    }
+    if (incidentDelivered(incident)) {
+      incidents[key] = closeIncidentRecord(incident, reason, at, closedBy);
+      result.closed.push(key);
+    } else {
+      incidents[key] = { ...incident, close_requested: { reason, requested_at: at, by: closedBy } };
+      result.deferred.push(key);
+    }
+  }
+  const touched = result.closed.length + result.deferred.length > 0;
+  const withRequest = {
+    ...alert,
+    incidents,
+    close_requested: closeAlert && touched ? { reason, requested_at: at, by: closedBy } : alert.close_requested,
+  };
+  return { alert: settleAlertClosures(syncAlertProjection(withRequest), at), ...result };
+}
+
+// CC3-E (item 19): the authoritative recovery set of an EVENT episode includes its delivered
+// (closed `event_delivered`) incidents. Delivery closure is bookkeeping; it never empties the set a
+// producer must positively re-evaluate before it may report the alert recovered.
+export function episodeRecoveryIncidentKeys(alertRecord) {
+  const alert = normalizeAlertRecord(alertRecord);
+  return Object.entries(alert.incidents ?? {})
+    .filter(([, incident]) => incident.status !== "closed" || incident.closed_reason === "event_delivered")
+    .filter(([, incident]) => !["recovered", "suppressed"].includes(incident.status))
+    .map(([key]) => key)
+    .sort();
 }
 
 export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
@@ -602,35 +844,88 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
     const incidentCandidates = grouped.get(id);
     const current = byId.get(id);
     const firstCandidate = [...incidentCandidates.values()].sort((left, right) => alertEpisodeKey(left).localeCompare(alertEpisodeKey(right)))[0];
-    const newEpisode = !current || current.status === "recovered"
-      || (!current.episode_started_at && !["acknowledged", "suppressed"].includes(current.status));
+    // C1.1 (I73): a closed incident is a tombstone. A candidate re-emitting it at or below its closed
+    // severity is history, not a new incident; a higher severity re-opens it (an escalation, due).
+    const reopensOrNew = (key, candidate) => {
+      const incident = current?.incidents?.[key];
+      if (!incident || incident.status !== "closed") return true;
+      return alertSeverityRank(candidatePayload(candidate).severity) > incidentSeverityRank(incident);
+    };
+    // `closed` re-arms like `recovered`, but a closed alert whose candidates only re-emit its
+    // tombstoned keys stays closed (no new episode, nothing due). Tombstones only absorb CONTINUOUS
+    // re-emission: a covered absence ends a closed alert exactly like an active one (recovery below),
+    // so a recurrence after it is a new episode and notifies (adversarial review B1).
+    const closedReopens = current?.status === "closed"
+      && [...incidentCandidates.entries()].some(([key, candidate]) => reopensOrNew(key, candidate));
+    const newEpisode = !current || current.status === "recovered" || closedReopens
+      || (!current.episode_started_at && !["acknowledged", "suppressed", "closed"].includes(current.status));
     const base = newEpisode
-      ? normalizeAlertRecord({ ...firstCandidate, status: "active", first_seen: now, last_seen: now, episode_started_at: now, incidents: {}, legacy_without_episode: current?.legacy_without_episode === true })
+      ? normalizeAlertRecord({ ...firstCandidate, status: "active", first_seen: now, last_seen: now, episode_started_at: now, incidents: {}, legacy_without_episode: current?.legacy_without_episode === true, tombstones_dropped_total: current?.tombstones_dropped_total ?? 0 })
       : normalizeAlertRecord(current);
+    // A new episode re-arms. After `recovered` (evidence the condition cleared) the incident map
+    // resets, exactly as notify-once does. After `closed` the closed incidents are carried over as
+    // tombstones, so the closed keys still never re-notify.
+    const carriedTombstones = closedReopens
+      ? Object.fromEntries(Object.entries(current.incidents ?? {}).filter(([, incident]) => incident.status === "closed"))
+      : {};
+    const staysClosed = !newEpisode && base.status === "closed";
     const next = {
       ...base,
-      status: base.status === "acknowledged" || base.status === "suppressed" ? base.status : "active",
+      status: staysClosed ? "closed" : (base.status === "acknowledged" || base.status === "suppressed" ? base.status : "active"),
       first_seen: base.first_seen,
       last_seen: now,
       episode_started_at: newEpisode ? now : base.episode_started_at,
       acknowledged_at: base.status === "acknowledged" ? base.acknowledged_at : null,
-      incidents: newEpisode ? {} : { ...base.incidents },
+      incidents: newEpisode ? { ...carriedTombstones } : { ...base.incidents },
       incident_state: newEpisode ? "normal" : base.incident_state,
       incident_storm_count: newEpisode ? 0 : base.incident_storm_count,
       incident_storm_notified_at: newEpisode ? null : base.incident_storm_notified_at,
+      incident_storm_notified_severity: newEpisode ? null : base.incident_storm_notified_severity,
       legacy_without_episode: newEpisode ? base.legacy_without_episode : base.legacy_without_episode,
     };
+    const wasStorm = next.incident_state === "incident_storm";
     let overflowCount = 0;
     const dueForAlert = [];
     const adjudicationForAlert = [];
+    // I63: a storm never swallows a severity escalation of an existing incident.
+    const escalationsForAlert = [];
+    const touchedKeys = [];
     for (const key of [...incidentCandidates.keys()].sort()) {
       const candidate = incidentCandidates.get(key);
       const previousIncident = next.incidents[key];
-      const liveIncidentCount = Object.values(next.incidents).filter((incident) => !["acknowledged", "recovered", "suppressed"].includes(incident.status)).length;
+      if (previousIncident?.status === "closed" && !reopensOrNew(key, candidate)) {
+        // Tombstone: observed again, still closed, never due.
+        next.incidents[key] = { ...previousIncident, last_seen: now };
+        continue;
+      }
+      const liveIncidentCount = Object.values(next.incidents).filter(isLiveIncident).length;
       if (!previousIncident && liveIncidentCount >= MAX_LIVE_INCIDENTS) {
+        const priorOverflow = next.overflow_summary?.[key];
+        const overflowPayload = candidatePayload(candidate);
+        next.overflow_summary = {
+          ...(next.overflow_summary ?? {}),
+          [key]: {
+            severity_max: alertSeverityRank(overflowPayload.severity) > alertSeverityRank(priorOverflow?.severity_max) ? overflowPayload.severity : (priorOverflow?.severity_max ?? overflowPayload.severity),
+            first_seen: priorOverflow?.first_seen ?? now,
+            last_seen: now,
+          },
+        };
+        if (priorOverflow && alertSeverityRank(overflowPayload.severity) > alertSeverityRank(priorOverflow.severity_max)) escalationsForAlert.push(key);
+        const stormSeverity = next.incident_storm_notified_severity ?? next.severity;
+        if (!priorOverflow && next.incident_storm_notified_at && alertSeverityRank(overflowPayload.severity) > alertSeverityRank(stormSeverity)) {
+          // The bounded overflow summary may have forgotten this key. Once the storm itself was
+          // delivered, any unseen key above that delivered severity is still an escalation.
+          escalationsForAlert.push(key);
+        }
         overflowCount += 1;
         continue;
       }
+      if (next.overflow_summary?.[key]) {
+        const overflowSummary = { ...next.overflow_summary };
+        delete overflowSummary[key];
+        next.overflow_summary = overflowSummary;
+      }
+      touchedKeys.push(key);
       const payload = candidatePayload(candidate);
       const incident = previousIncident ?? {
         first_seen: now,
@@ -651,6 +946,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         payload,
       };
       const severityEscalated = incidentSeverityRank({ severity_max: payload.severity }) > incidentSeverityRank(previousIncident);
+      const reopened = previousIncident?.status === "closed";
       const selectedCandidate = candidate;
       next.incidents[key] = {
         ...incident,
@@ -662,12 +958,20 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         // remain active and are due under the normal rules.
         status: base.status === "acknowledged" && previousIncident && !severityEscalated ? previousIncident.status : "active",
         payload: candidatePayload(selectedCandidate),
+        // I63: producer-declared close-on-delivery (a learned EVENT incident). Sticky per incident.
+        close_on_delivery: incident.close_on_delivery === true || candidate.close_on_delivery === true,
+        ...(reopened ? { closed_reason: null, closed_at: null, closed_by: null, close_requested: null, reopened_at: now } : {}),
+        // An escalation is new information: a closure request made on the lower severity never
+        // carries over to it (review L3).
+        ...(previousIncident && severityEscalated ? { escalated_at: now, close_requested: null } : {}),
       };
       const newIncident = !previousIncident;
       const legacySuppressed = next.legacy_without_episode;
-      if (next.incident_state !== "incident_storm" && !legacySuppressed && notificationDueForIncident(next, next.incidents[key], { newIncident, severityEscalated, nowMs: new Date(now).getTime() })) {
+      const due = !legacySuppressed && notificationDueForIncident(next, next.incidents[key], { newIncident, severityEscalated, nowMs: new Date(now).getTime() });
+      if (next.incident_state !== "incident_storm" && due) {
         dueForAlert.push({ alert_id: id, incident_key: key });
       }
+      if (!newIncident && due && (severityEscalated || escalationPending(next.incidents[key]))) escalationsForAlert.push(key);
       const sameNegativeAdjudication = next.incidents[key].adjudication?.notify === false
         && next.incidents[key].adjudication?.severity === next.incidents[key].severity_max;
       if (next.incident_state !== "incident_storm" && !legacySuppressed && !sameNegativeAdjudication && (newIncident || severityEscalated || dueForAlert.some((entry) => entry.incident_key === key))) {
@@ -675,17 +979,61 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       }
     }
 
+    const liveAfter = Object.values(next.incidents).filter(isLiveIncident).length;
     if (overflowCount > 0) {
       next.incident_state = "incident_storm";
       next.incident_key_overflow = true;
-      const liveIncidentCount = Object.values(next.incidents).filter((incident) => !["acknowledged", "recovered", "suppressed"].includes(incident.status)).length;
-      next.incident_storm_count = Math.max(next.incident_storm_count ?? 0, liveIncidentCount + overflowCount);
+      next.incident_storm_count = Math.max(next.incident_storm_count ?? 0, liveAfter + overflowCount);
       dueForAlert.length = 0;
       adjudicationForAlert.length = 0;
-      if (!next.incident_storm_notified_at && !["suppressed", "recovered"].includes(next.status) && !next.legacy_without_episode
+      if (!next.incident_storm_notified_at && !isUndeliverableStatus(next.status) && !next.legacy_without_episode
         && deliveryBackoffEligible(next, new Date(now).getTime())) {
         dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
       }
+      for (const key of escalationsForAlert) if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
+    } else if (wasStorm && liveAfter < MAX_LIVE_INCIDENTS) {
+      // I63: the storm exits once the live incidents fall below the cap with no overflow this tick.
+      // Live incidents the delivered storm notification covered are marked covered at their current
+      // severity (an escalation still notifies); without a delivered storm notification nothing is
+      // covered. EVERY live incident left undelivered and uncovered then becomes due individually,
+      // whether or not it was re-emitted this tick (never silence; adversarial review H2).
+      const covered = next.incident_storm_notified_at;
+      for (const [key, incident] of Object.entries(next.incidents)) {
+        if (!isLiveIncident(incident) || incidentDelivered(incident) || !covered) continue;
+        // A pending escalation is never covered by a storm notification: it stays individually due.
+        if (incident.escalated_at) continue;
+        // Only incidents that already existed when the storm notification was delivered.
+        if (!(Date.parse(incident.first_seen) <= Date.parse(covered))) continue;
+        next.incidents[key] = { ...incident, storm_covered_at: covered, storm_covered_severity: incident.severity_max };
+      }
+      next.incident_state = "normal";
+      next.incident_key_overflow = false;
+      next.incident_storm_count = 0;
+      next.incident_storm_notified_at = null;
+      next.incident_storm_notified_severity = null;
+      next.incident_storm_failure_count = 0;
+      next.next_attempt_at = null;
+      next.last_attempt_at = null;
+      next.backoff_delay_ms = null;
+      for (const key of Object.keys(next.incidents).sort()) {
+        const incident = next.incidents[key];
+        if (!isLiveIncident(incident) || incidentDelivered(incident)) continue;
+        if (next.legacy_without_episode || !notificationDueForIncident(next, incident, { newIncident: touchedKeys.includes(key) && !incident.confirmed_at && !incident.storm_covered_at && incident.first_seen === now, nowMs: new Date(now).getTime() })) continue;
+        if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
+        if (!adjudicationForAlert.some((entry) => entry.incident_key === key)) adjudicationForAlert.push({ alert_id: id, incident_key: key });
+      }
+    }
+    if (next.incident_state === "incident_storm") {
+      for (const key of escalationsForAlert) {
+        if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
+        if (!adjudicationForAlert.some((entry) => entry.incident_key === key)) adjudicationForAlert.push({ alert_id: id, incident_key: key });
+      }
+    }
+    // A new incident or escalation clears an alert-level closure request: the request covered only
+    // the incidents that existed when it was made.
+    if (next.close_requested && touchedKeys.some((key) => !current?.incidents?.[key] || current.incidents[key].status === "closed"
+      || incidentSeverityRank(next.incidents[key]) > incidentSeverityRank(current.incidents[key]))) {
+      next.close_requested = null;
     }
     notificationDueIncidents.push(...dueForAlert);
     adjudicationDueIncidents.push(...adjudicationForAlert);
@@ -694,13 +1042,20 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
 
   for (const [id, alert] of byId) {
     const isCovered = !coveredAlertIds || coveredAlertIds.has(alert.id);
-    if (isCovered && !activeCandidateIds.has(id) && ["active", "acknowledged"].includes(alert.status)) {
+    // A closed alert recovers too (review B1): a closure covers the episode it was made on, never a
+    // later recurrence. Without this a default-keyed, severity-capped rule (service.disappeared,
+    // service.appeared, scheduled_job.appeared, process.lineage.novel_edge) closed once would stay
+    // silent forever, since it can present neither a new key nor a higher severity.
+    if (isCovered && !activeCandidateIds.has(id) && ["active", "acknowledged", "closed"].includes(alert.status)) {
       byId.set(id, normalizeAlertRecord({
         ...alert,
         status: "recovered",
         last_seen: now,
         legacy_without_episode: false,
-        incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, { ...incident, status: "recovered" }])),
+        close_requested: null,
+        // A closed incident stays closed: recovery is about the live condition, and the next
+        // episode starts from an empty map anyway (re-arm after positive evidence).
+        incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, incident.status === "closed" ? incident : { ...incident, status: "recovered" }])),
       }));
     }
   }
@@ -712,16 +1067,19 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   // same result.
   for (const [id, alert] of byId) {
     if (alert.incident_state === "incident_storm") {
-      if (!alert.incident_storm_notified_at && !["suppressed", "recovered"].includes(alert.status)
+      if (!alert.incident_storm_notified_at && !isUndeliverableStatus(alert.status)
         && !alert.legacy_without_episode && deliveryBackoffEligible(alert, new Date(now).getTime())) {
         if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === INCIDENT_STORM_KEY)) {
           notificationDueIncidents.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: alert.incident_storm_count });
         }
       }
-      continue;
     }
     if (alert.legacy_without_episode) continue;
+    const inStorm = alert.incident_state === "incident_storm";
     for (const [key, incident] of Object.entries(alert.incidents ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
+      // I63: inside a storm only a pending escalation of an already-delivered incident is retried
+      // individually; every other incident is represented by the storm notification.
+      if (inStorm && !escalationPending(incident)) continue;
       // A candidate that was never attempted is not a persisted retry. New/unconfirmed work is
       // still surfaced by the current candidate group above; this fallback is specifically for an
       // already-attempted delivery that failed and then disappeared from detector output.
@@ -808,13 +1166,14 @@ export async function confirmAlertDelivery(descartesPaths, alertIdValue, options
   const alerts = await readAlertRecords(descartesPaths);
   let confirmed = false;
   const updated = alerts.map((alert) => {
-    if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+    if (alert.id !== alertIdValue || isUndeliverableStatus(alert.status)) return alert;
     const incidentKey = options.incidentKey ?? options.episodeKey ?? alertEpisodeKey(alert);
     if (incidentKey === INCIDENT_STORM_KEY) {
       confirmed = true;
       return syncAlertProjection({
         ...alert,
         incident_storm_notified_at: now,
+        incident_storm_notified_severity: options.severity ?? alert.severity,
         last_notified: now,
         last_attempt_at: now,
         delivery_failure_count: 0,
@@ -843,10 +1202,11 @@ export async function confirmAlertDelivery(descartesPaths, alertIdValue, options
       last_attempt_at: now,
       backoff_delay_ms: null,
     };
-    return syncAlertProjection({
+    // C1.1: a delivered incident's pending closure (close-on-delivery or a deferred request) applies.
+    return settleAlertClosures(syncAlertProjection({
       ...alert,
       incidents: { ...alert.incidents, [incidentKey]: updatedIncident },
-    });
+    }), now);
   });
   if (!confirmed) return { confirmed: false };
   const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
@@ -858,7 +1218,7 @@ export async function recordAlertDeliveryFailure(descartesPaths, alertIdValue, o
   const alerts = await readAlertRecords(descartesPaths);
   let recorded = false;
   const updated = alerts.map((alert) => {
-    if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+    if (alert.id !== alertIdValue || isUndeliverableStatus(alert.status)) return alert;
     const incidentKey = options.incidentKey ?? options.episodeKey ?? alertEpisodeKey(alert);
     if (incidentKey === INCIDENT_STORM_KEY) {
       recorded = true;
@@ -903,7 +1263,7 @@ export async function recordAlertDeliveryFailures(descartesPaths, failures, opti
   let recorded = false;
   for (const failure of entries) {
     const alert = updated.get(failure.alertId);
-    if (!alert || ["recovered", "suppressed"].includes(alert.status)) continue;
+    if (!alert || isUndeliverableStatus(alert.status)) continue;
     const incidentKey = failure.incidentKey ?? failure.episodeKey ?? alertEpisodeKey(alert);
     if (incidentKey === INCIDENT_STORM_KEY) {
       recorded = true;
@@ -959,7 +1319,7 @@ export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, opti
 
   for (const outcome of entries) {
     const alert = updated.get(outcome.alertId);
-    if (!alert || ["recovered", "suppressed"].includes(alert.status)) continue;
+    if (!alert || isUndeliverableStatus(alert.status)) continue;
     const incidentKey = outcome.incidentKey ?? outcome.episodeKey ?? alertEpisodeKey(alert);
     if (outcome.status === "adjudication") {
       const incident = alert.incidents?.[incidentKey];
@@ -984,6 +1344,7 @@ export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, opti
         updated.set(alert.id, syncAlertProjection({
           ...alert,
           incident_storm_notified_at: now,
+          incident_storm_notified_severity: outcome.severity ?? alert.severity,
           last_notified: now,
           last_attempt_at: now,
           delivery_failure_count: 0,
@@ -1001,7 +1362,7 @@ export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, opti
       const currentRank = incident.notified_severity === null || incident.notified_severity === undefined ? -1 : alertSeverityRank(incident.notified_severity);
       const nextSeverity = outcome.severity ?? incident.severity_max ?? alert.severity;
       const nextRank = alertSeverityRank(nextSeverity);
-      updated.set(alert.id, syncAlertProjection({
+      updated.set(alert.id, settleAlertClosures(syncAlertProjection({
         ...alert,
         incidents: {
           ...alert.incidents,
@@ -1018,7 +1379,7 @@ export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, opti
             backoff_delay_ms: null,
           },
         },
-      }));
+      }), now));
       continue;
     }
     if (outcome.status !== "failure") continue;
@@ -1069,7 +1430,7 @@ export async function recordAlertAdjudication(descartesPaths, alertIdValue, opti
   const alerts = await readAlertRecords(descartesPaths);
   let recorded = false;
   const updated = alerts.map((alert) => {
-    if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+    if (alert.id !== alertIdValue || isUndeliverableStatus(alert.status)) return alert;
     const incidentKey = options.incidentKey ?? options.episodeKey ?? alertEpisodeKey(alert);
     const incident = alert.incidents?.[incidentKey];
     if (!incident) return alert;
@@ -1100,7 +1461,8 @@ export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
     found = true;
     return normalizeAlertRecord({
       ...alert,
-      status: "acknowledged",
+      // Acknowledgement is receipt only (§9); it never re-opens or replaces a closure.
+      status: alert.status === "closed" ? "closed" : "acknowledged",
       acknowledged_at: now,
       // Acknowledging a storm ends suppression for this episode. Existing keys are retained as
       // acknowledged history, while a later producer key is a normal new incident and may notify.
@@ -1108,13 +1470,14 @@ export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
       incident_key_overflow: false,
       incident_storm_count: 0,
       incident_storm_notified_at: null,
+      incident_storm_notified_severity: null,
       incident_storm_failure_count: 0,
       next_attempt_at: null,
       last_attempt_at: null,
       backoff_delay_ms: null,
       incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, {
         ...incident,
-        status: ["recovered", "suppressed"].includes(incident.status) ? incident.status : "acknowledged",
+        status: isUndeliverableStatus(incident.status) ? incident.status : "acknowledged",
         next_attempt_at: null,
         backoff_delay_ms: null,
       }])),
