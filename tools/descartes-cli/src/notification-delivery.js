@@ -11,6 +11,10 @@ const execFileAsync = promisify(execFile);
 
 export const NOTIFICATION_CHANNELS = new Set(["cli", "macos-desktop", "macos-native", "linux-desktop", "syslog"]);
 export const MAX_PENDING_NOTIFICATIONS = 512;
+export const MAX_RETAINED_NOTIFICATION_NOTICES = 50;
+export const NOTIFICATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const NOTIFICATION_RETRY_BASE_MS = 60_000;
+export const NOTIFICATION_RETRY_CAP_MS = 60 * 60 * 1000;
 export const NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID = "integrity.notification_outbox";
 const NOTIFICATION_OUTBOX_OVERFLOW_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:overflow`;
 const NOTIFICATION_OUTBOX_CORRUPT_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:corrupt`;
@@ -22,8 +26,6 @@ export function resolveNotificationDeliveryPaths(descartesPaths) {
     auditDir: alertsDir,
     auditFile: path.join(alertsDir, "notification-delivery.jsonl"),
     pendingFile: path.join(alertsDir, "notification-pending.json"),
-    seenFile: path.join(alertsDir, "notification-seen.jsonl"),
-    seenCursorFile: path.join(alertsDir, "notification-seen.cursor.json"),
   };
 }
 
@@ -31,8 +33,8 @@ function isIsoString(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
-/** Stored notices are an outbox record, not an arbitrary notification payload. */
-export function isNotificationEntry(entry, section = "pending") {
+/** Stored notices are retained delivery records, not arbitrary notification payloads. */
+export function isNotificationEntry(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
   if (typeof entry.id !== "string" || entry.id.length === 0) return false;
   if (typeof entry.digest !== "string" || entry.digest.length === 0) return false;
@@ -44,49 +46,102 @@ export function isNotificationEntry(entry, section = "pending") {
   if (!(entry.last_status === null || typeof entry.last_status === "string")) return false;
   if (entry.notices_overflowed !== undefined && (!Number.isSafeInteger(entry.notices_overflowed) || entry.notices_overflowed < 0)) return false;
   if (entry.corruption !== undefined && typeof entry.corruption !== "string") return false;
-  if (section === "seen" && (!isIsoString(entry.seen_at) || entry.resolution !== "viewed")) return false;
-  if (section === "resolved" && (!isIsoString(entry.resolved_at) || typeof entry.resolution !== "string" || entry.resolution.length === 0)) return false;
+  if (entry.delivered_at !== undefined && !isIsoString(entry.delivered_at)) return false;
+  if (entry.last_attempt_at !== undefined && !isIsoString(entry.last_attempt_at)) return false;
+  if (entry.next_attempt_at !== undefined && !isIsoString(entry.next_attempt_at)) return false;
   return true;
 }
 
-export function filterNotificationEntries(entries, section = "pending") {
+export function filterNotificationEntries(entries) {
   const valid = [];
   let skipped = 0;
   for (const entry of Array.isArray(entries) ? entries : []) {
-    if (isNotificationEntry(entry, section)) valid.push(entry);
+    if (isNotificationEntry(entry)) valid.push(entry);
     else skipped += 1;
   }
   return { entries: valid, skipped };
 }
-
-// The daemon is the only outbox writer. CLI processes append seen marks to the separate log below.
 
 async function parseOutbox(pendingFile) {
   let text;
   try {
     text = await fs.readFile(pendingFile, "utf8");
   } catch (error) {
-    if (error?.code === "ENOENT") return { state: { v: 1, pending: [], seen: [], resolved: [] } };
-    return { error };
+    if (error?.code === "ENOENT") return { state: { v: 2, notices: [] } };
+    return { kind: "io", error };
   }
+  let parsed;
   try {
-    const parsed = JSON.parse(text);
-    if (parsed?.v !== 1 || !Array.isArray(parsed.pending) || !Array.isArray(parsed.seen) || !Array.isArray(parsed.resolved)) {
-      throw new Error("notification outbox has an invalid schema");
-    }
-    for (const [section, entries] of [["pending", parsed.pending], ["seen", parsed.seen], ["resolved", parsed.resolved]]) {
-      const invalidIndex = entries.findIndex((entry) => !isNotificationEntry(entry, section));
-      if (invalidIndex >= 0) throw new Error(`notification outbox has an invalid ${section} entry at index ${invalidIndex}`);
-    }
-    return { state: { v: 1, pending: parsed.pending, seen: parsed.seen, resolved: parsed.resolved } };
+    parsed = JSON.parse(text);
   } catch (error) {
-    return { error };
+    return { kind: "corrupt", error, salvaged: salvageNotificationEntries(text) };
   }
+  const validShape = parsed?.v === 2 && Array.isArray(parsed.notices)
+    && Object.keys(parsed).every((key) => ["v", "notices", "updated_at"].includes(key));
+  const notices = Array.isArray(parsed?.notices) ? parsed.notices : [];
+  const invalidIndex = notices.findIndex((entry) => !isNotificationEntry(entry));
+  if (!validShape || invalidIndex >= 0) {
+    const message = !validShape
+      ? "notification outbox has an invalid schema"
+      : `notification outbox has an invalid notice at index ${invalidIndex}`;
+    return { kind: "corrupt", error: new Error(message), salvaged: notices.filter(isNotificationEntry) };
+  }
+  return { state: { v: 2, notices } };
 }
 
-function unrecoveredOutbox(message, now) {
-  // The integrity notice is surfaced in memory; a writer must quarantine before writing.
-  return { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message } };
+function scanJsonValues(text) {
+  const values = [];
+  for (let start = 0; start < text.length; start += 1) {
+    if (text[start] !== "{") continue;
+    const stack = [];
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') {
+        inString = true;
+        continue;
+      }
+      if (character === "{" || character === "[") stack.push(character);
+      else if (character === "}" || character === "]") {
+        const expected = character === "}" ? "{" : "[";
+        if (stack.at(-1) !== expected) break;
+        stack.pop();
+        if (stack.length === 0) {
+          try { values.push(JSON.parse(text.slice(start, index + 1))); } catch { /* not a complete value */ }
+          break;
+        }
+      }
+    }
+  }
+  return values;
+}
+
+function salvageNotificationEntries(text) {
+  const candidates = [];
+  for (const value of scanJsonValues(text)) {
+    if (isNotificationEntry(value)) candidates.push(value);
+    for (const entry of value?.notices ?? []) if (isNotificationEntry(entry)) candidates.push(entry);
+  }
+  const unique = new Map();
+  for (const entry of candidates) unique.set(entry.id, entry);
+  return [...unique.values()];
+}
+
+function publicOutboxState(notices, extras = {}) {
+  const valid = filterNotificationEntries(notices).entries;
+  const pending = valid.filter((entry) => !["delivered", "cli_only", "skipped"].includes(entry.last_status));
+  return { v: 2, notices: valid, pending, ...extras };
+}
+
+function outboxErrorState(error) {
+  return publicOutboxState([], { outbox_error: { code: error?.code, message: error?.message ?? String(error) } });
 }
 
 /** The daemon re-reads, quarantines, and replaces a corrupt outbox. */
@@ -94,7 +149,8 @@ export async function recoverNotificationOutbox(descartesPaths) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const now = new Date().toISOString();
   const read = await parseOutbox(pendingFile);
-  if (read.state) return read.state;
+  if (read.state) return publicOutboxState(read.state.notices);
+  if (read.kind === "io") return outboxErrorState(read.error);
   let message = read.error?.message ?? String(read.error);
   try {
     try {
@@ -103,25 +159,26 @@ export async function recoverNotificationOutbox(descartesPaths) {
       // Keep the durable integrity signal even when the original file cannot be moved.
       if (error?.code !== "ENOENT") message = `${message}; quarantine failed: ${error?.message ?? String(error)}`;
     }
-    const fresh = { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [] };
+    const salvaged = filterNotificationEntries(read.salvaged).entries;
+    const fresh = { v: 2, notices: [outboxIntegrityEntry("corrupt", message, now), ...salvaged.filter((entry) => entry.id !== NOTIFICATION_OUTBOX_CORRUPT_ID)] };
     await atomicWrite(pendingFile, JSON.stringify({ ...fresh, updated_at: now }));
-    return { ...fresh, tamper: { kind: "notification_outbox_corrupt", message }, recovered: true };
+    return publicOutboxState(fresh.notices, { tamper: { kind: "notification_outbox_corrupt", message }, recovered: true });
   } catch (recoveryError) {
-    return unrecoveredOutbox(`${message}; recovery failed: ${recoveryError?.message ?? String(recoveryError)}`, now);
+    return publicOutboxState([outboxIntegrityEntry("corrupt", `${message}; recovery failed: ${recoveryError?.message ?? String(recoveryError)}`, now)], { tamper: { kind: "notification_outbox_corrupt", message } });
   }
 }
 
 /**
- * Reads the required-notice outbox. Every entry in pending/seen/resolved must have the full outbox
- * record shape; a parseable-but-malformed outbox is as corrupt as invalid JSON. A corrupt outbox is
- * reported in memory as a pending integrity notice. It never writes, renames, or quarantines; the
- * daemon calls recoverNotificationOutbox on its next tick.
+ * Reads the required-notice outbox. A parseable-but-malformed outbox is corruption; filesystem
+ * failures are not. This function never writes, renames, or quarantines.
  */
 export async function readPendingNotifications(descartesPaths) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const read = await parseOutbox(pendingFile);
-  if (read.state) return read.state;
-  return unrecoveredOutbox(read.error?.message ?? String(read.error), new Date().toISOString());
+  if (read.state) return publicOutboxState(read.state.notices);
+  if (read.kind === "io") return outboxErrorState(read.error);
+  const message = read.error?.message ?? String(read.error);
+  return publicOutboxState([outboxIntegrityEntry("corrupt", message, new Date().toISOString())], { tamper: { kind: "notification_outbox_corrupt", message } });
 }
 
 function pendingNoticeDigest(decision, options = {}) {
@@ -157,7 +214,7 @@ function updateOverflowSummary(existing, count, now) {
 }
 
 async function writePendingState(pendingFile, state, now) {
-  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-MAX_PENDING_NOTIFICATIONS), resolved: state.resolved.slice(-MAX_PENDING_NOTIFICATIONS), updated_at: now }));
+  await atomicWrite(pendingFile, JSON.stringify({ v: 2, notices: state.notices, updated_at: now }));
 }
 
 export async function queuePendingNotification(descartesPaths, decision, options = {}) {
@@ -165,10 +222,11 @@ export async function queuePendingNotification(descartesPaths, decision, options
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   await ensureParent(pendingFile);
-  let state = await recoverNotificationOutbox(descartesPaths);
+  const state = await recoverNotificationOutbox(descartesPaths);
+  if (state.outbox_error) throw Object.assign(new Error(state.outbox_error.message), { code: state.outbox_error.code });
   const payload = normalizeNotificationPayload(decision, options);
   const id = String(options.requiredNoticeId);
-  const existing = state.pending.find((entry) => entry.id === id);
+  const existing = state.notices.find((entry) => entry.id === id);
   const entry = existing ?? {
     id,
     digest: pendingNoticeDigest(decision, options),
@@ -181,176 +239,131 @@ export async function queuePendingNotification(descartesPaths, decision, options
     last_status: null,
   };
   if (!existing) {
-    const summary = state.pending.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
-    if (state.pending.length < MAX_PENDING_NOTIFICATIONS) {
-      state.pending.push(entry);
+    const summary = state.notices.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
+    if (state.notices.length < MAX_PENDING_NOTIFICATIONS) {
+      state.notices.push(entry);
     } else if (summary) {
-      state.pending = state.pending.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
-      state.pending.push(updateOverflowSummary(summary, 1, now));
+      state.notices = state.notices.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+      state.notices.push(updateOverflowSummary(summary, 1, now));
     } else {
-      const displaced = Math.max(1, state.pending.length - (MAX_PENDING_NOTIFICATIONS - 1));
-      state.pending = state.pending.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
-      state.pending.push(updateOverflowSummary(undefined, displaced + 1, now));
+      const displaced = Math.max(1, state.notices.length - (MAX_PENDING_NOTIFICATIONS - 1));
+      state.notices = state.notices.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+      state.notices.push(updateOverflowSummary(undefined, displaced + 1, now));
     }
   }
-  await writePendingState(pendingFile, state, now);
+  await writePendingState(pendingFile, { notices: state.notices }, now);
   return existing ?? entry;
 }
 
 async function settlePendingNotification(descartesPaths, id, status, now) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const state = await recoverNotificationOutbox(descartesPaths);
-  const index = state.pending.findIndex((entry) => entry.id === id);
+  if (state.outbox_error) throw Object.assign(new Error(state.outbox_error.message), { code: state.outbox_error.code });
+  const index = state.notices.findIndex((entry) => entry.id === id);
   if (index < 0) return;
-  const [entry] = state.pending.splice(index, 1);
-  state.resolved.push({ ...entry, resolved_at: normalizeIso(now, "resolved_at"), resolution: String(status || "resolved") });
-  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+  const entry = state.notices[index];
+  const at = normalizeIso(now, "delivery timestamp");
+  const delivered = status === "delivered" || status === "cli_only";
+  state.notices[index] = {
+    ...entry,
+    last_status: String(status || "delivered"),
+    ...(delivered ? { delivered_at: entry.delivered_at ?? at, next_attempt_at: undefined } : {}),
+  };
+  await writePendingState(pendingFile, { notices: state.notices }, at);
 }
 
 export async function resolvePendingNotification(descartesPaths, id, status, now = new Date().toISOString()) {
   return settlePendingNotification(descartesPaths, id, status, now);
 }
 
-const MAX_SEEN_MARK_ID_LENGTH = 512;
-const MAX_SEEN_MARK_LINE_BYTES = 4096;
-
-function normalizeSeenMark(mark) {
-  if (!mark || typeof mark !== "object" || Array.isArray(mark) || mark.v !== 1) return undefined;
-  if (typeof mark.id !== "string" || mark.id.length === 0 || mark.id.length > MAX_SEEN_MARK_ID_LENGTH) return undefined;
-  if (!isIsoString(mark.seen_at)) return undefined;
-  return { v: 1, id: mark.id, seen_at: new Date(mark.seen_at).toISOString() };
-}
-
-/** CLI writers append one bounded JSON line. The daemon is the sole consumer and outbox writer. */
-export async function appendSeenNotification(descartesPaths, id, { now = new Date().toISOString() } = {}) {
-  const { seenFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const mark = normalizeSeenMark({ v: 1, id: String(id), seen_at: normalizeIso(now, "seen_at") });
-  if (!mark) throw new Error("invalid notification seen mark");
-  const line = Buffer.from(`${JSON.stringify(mark)}\n`);
-  if (line.byteLength > MAX_SEEN_MARK_LINE_BYTES) throw new Error("notification seen mark exceeds PIPE_BUF-safe line size");
-  await ensureParent(seenFile);
-  const handle = await fs.open(seenFile, fsSync.constants.O_APPEND | fsSync.constants.O_CREAT | fsSync.constants.O_WRONLY, 0o600);
-  try {
-    const written = await handle.write(line, 0, line.byteLength);
-    if (written.bytesWritten !== line.byteLength) throw new Error("notification seen mark was only partially appended");
-  } finally {
-    await handle.close();
-  }
-  return mark;
-}
-
-function seenArchiveName(name) {
-  return /^notification-seen\.jsonl\.consumed-[0-9]+-[0-9a-f-]+$/.test(name);
-}
-
-async function readSeenCursor(file) {
-  try {
-    const cursor = JSON.parse(await fs.readFile(file, "utf8"));
-    return cursor?.v === 1 && cursor.files && typeof cursor.files === "object" ? cursor.files : {};
-  } catch (error) {
-    if (error?.code === "ENOENT") return {};
-    return {};
-  }
-}
-
-async function writeSeenCursor(file, files) {
-  await atomicWrite(file, JSON.stringify({ v: 1, files }));
-}
-
-async function seenFiles(descartesPaths) {
-  const { seenFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const dir = path.dirname(seenFile);
-  let entries;
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === "ENOENT") return [];
-    throw error;
-  }
-  return [
-    ...(entries.some((entry) => entry.isFile() && entry.name === path.basename(seenFile)) ? [seenFile] : []),
-    ...entries.filter((entry) => entry.isFile() && seenArchiveName(entry.name)).map((entry) => path.join(dir, entry.name)).sort(),
-  ];
-}
-
-function fileIdentity(stat) {
-  return { dev: Number(stat.dev), ino: Number(stat.ino) };
-}
-
-async function readNewSeenMarks(file, cursor) {
-  let stat;
-  try {
-    stat = await fs.stat(file);
-  } catch (error) {
-    if (error?.code === "ENOENT") return { marks: [], malformed: 0, next: undefined };
-    throw error;
-  }
-  const identity = fileIdentity(stat);
-  const prior = cursor?.dev === identity.dev && cursor?.ino === identity.ino && Number.isSafeInteger(cursor.offset) && cursor.offset <= stat.size
-    ? cursor.offset
-    : 0;
-  const bytes = await fs.readFile(file);
-  let consumed = prior;
-  const marks = [];
-  let malformed = 0;
-  while (consumed < bytes.length) {
-    const newline = bytes.indexOf(10, consumed);
-    if (newline < 0) break;
-    const line = bytes.subarray(consumed, newline).toString("utf8");
-    consumed = newline + 1;
-    try {
-      const mark = normalizeSeenMark(JSON.parse(line));
-      if (mark) marks.push(mark);
-      else malformed += 1;
-    } catch {
-      malformed += 1;
-    }
-  }
-  return { marks, malformed, next: { ...identity, offset: consumed } };
-}
-
-/** Fold CLI marks into the daemon-owned outbox, then checkpoint and rotate consumed log bytes. */
-export async function foldNotificationSeenLog(descartesPaths, { now = new Date().toISOString(), beforeRotate } = {}) {
-  const { pendingFile, seenCursorFile, seenFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  await ensureParent(seenFile);
-  const cursor = await readSeenCursor(seenCursorFile);
-  const files = await seenFiles(descartesPaths);
-  const marks = [];
-  let malformed = 0;
-  const nextCursor = {};
-  for (const file of files) {
-    const result = await readNewSeenMarks(file, cursor[file]);
-    marks.push(...result.marks);
-    malformed += result.malformed;
-    if (result.next) nextCursor[file] = result.next;
-  }
+async function recordNotificationFailure(descartesPaths, id, status, now) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const state = await recoverNotificationOutbox(descartesPaths);
-  const seenIds = new Set();
-  for (const mark of marks) {
-    const index = state.pending.findIndex((entry) => entry.id === mark.id);
-    if (index < 0 || seenIds.has(mark.id)) continue;
-    const [entry] = state.pending.splice(index, 1);
-    state.seen.push({ ...entry, seen_at: mark.seen_at, resolution: "viewed" });
-    seenIds.add(mark.id);
-  }
-  if (seenIds.size > 0) await writePendingState(pendingFile, state, normalizeIso(now, "now"));
-  await writeSeenCursor(seenCursorFile, nextCursor);
-  await beforeRotate?.();
-  const active = nextCursor[seenFile];
-  if (active && active.offset > 0) {
-    const archive = `${seenFile}.consumed-${Date.now()}-${crypto.randomUUID()}`;
-    await fs.rename(seenFile, archive);
-    await fs.writeFile(seenFile, "", { flag: "a", mode: 0o600 });
-    nextCursor[archive] = active;
-    const newStat = await fs.stat(seenFile);
-    nextCursor[seenFile] = { ...fileIdentity(newStat), offset: 0 };
-    await writeSeenCursor(seenCursorFile, nextCursor);
-  }
-  return { seen: seenIds.size, malformed, marks: marks.length };
+  if (state.outbox_error) throw Object.assign(new Error(state.outbox_error.message), { code: state.outbox_error.code });
+  const index = state.notices.findIndex((entry) => entry.id === id);
+  if (index < 0) return;
+  const entry = state.notices[index];
+  const attempts = (entry.attempts ?? 0) + 1;
+  const delay = Math.min(NOTIFICATION_RETRY_CAP_MS, NOTIFICATION_RETRY_BASE_MS * (2 ** Math.min(attempts - 1, 16)));
+  const at = normalizeIso(now, "attempt timestamp");
+  state.notices[index] = {
+    ...entry,
+    attempts,
+    last_status: typeof status === "string" ? status : "error",
+    last_attempt_at: at,
+    next_attempt_at: new Date(Date.parse(at) + delay).toISOString(),
+  };
+  await writePendingState(pendingFile, { notices: state.notices }, at);
 }
 
 async function ensureParent(file) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+}
+
+function noticeDelivered(entry) {
+  return entry?.last_status === "delivered" || entry?.last_status === "cli_only";
+}
+
+function noticeAttemptDue(entry, nowMs) {
+  if (noticeDelivered(entry)) return false;
+  const nextAttemptMs = Date.parse(entry?.next_attempt_at ?? "");
+  return !Number.isFinite(nextAttemptMs) || nextAttemptMs <= nowMs;
+}
+
+/** Selects the read-only operator view. It never changes the outbox. */
+export function selectNotificationNoticeWindow(state, { now = new Date().toISOString() } = {}) {
+  const nowMs = Date.parse(normalizeIso(now, "now"));
+  const cutoffMs = nowMs - NOTIFICATION_RETENTION_MS;
+  const source = filterNotificationEntries(state?.notices ?? state?.pending ?? state).entries;
+  const overflowed = source.reduce((sum, entry) => sum + (entry.id === NOTIFICATION_OUTBOX_OVERFLOW_ID ? (entry.notices_overflowed ?? 0) : 0), 0);
+  const summary = source.find((entry) => entry.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
+  const recent = source
+    .filter((entry) => entry.id !== NOTIFICATION_OUTBOX_OVERFLOW_ID)
+    .filter((entry) => {
+      const firstSeenMs = Date.parse(entry.first_seen_at);
+      return entry.rule_id === NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID
+        || (Number.isFinite(firstSeenMs) && firstSeenMs >= cutoffMs && firstSeenMs <= nowMs);
+    })
+    .sort((left, right) => right.first_seen_at.localeCompare(left.first_seen_at) || right.id.localeCompare(left.id));
+  const entries = [...recent.slice(0, MAX_RETAINED_NOTIFICATION_NOTICES), ...(summary ? [summary] : [])];
+  const older_count = Math.max(0, recent.length - MAX_RETAINED_NOTIFICATION_NOTICES)
+    + source.filter((entry) => entry.id !== NOTIFICATION_OUTBOX_OVERFLOW_ID && Date.parse(entry.first_seen_at) < cutoffMs).length
+    + overflowed;
+  return {
+    entries,
+    older_count,
+    overflowed_count: overflowed,
+    pending_count: entries.filter((entry) => !noticeDelivered(entry)).length,
+  };
+}
+
+/** Daemon-only time/count retention. CLI reads never call this function. */
+export async function retainNotificationOutbox(descartesPaths, { now = new Date().toISOString() } = {}) {
+  const normalizedNow = normalizeIso(now, "now");
+  const state = await recoverNotificationOutbox(descartesPaths);
+  if (state.outbox_error) return { status: "warning", outbox_error: state.outbox_error };
+  const nowMs = Date.parse(normalizedNow);
+  const cutoffMs = nowMs - NOTIFICATION_RETENTION_MS;
+  const summary = state.notices.find((entry) => entry.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
+  const candidates = state.notices.filter((entry) => entry.id !== NOTIFICATION_OUTBOX_OVERFLOW_ID);
+  const kept = candidates
+    .filter((entry) => {
+      const firstSeenMs = Date.parse(entry.first_seen_at);
+      return firstSeenMs >= cutoffMs && firstSeenMs <= nowMs;
+    })
+    .sort((left, right) => right.first_seen_at.localeCompare(left.first_seen_at) || right.id.localeCompare(left.id))
+    .slice(0, MAX_RETAINED_NOTIFICATION_NOTICES);
+  const keptIds = new Set(kept.map((entry) => entry.id));
+  const dropped = candidates.filter((entry) => !keptIds.has(entry.id));
+  const droppedCount = dropped.length + dropped.reduce((sum, entry) => sum + (entry.notices_overflowed ?? 0), 0);
+  const nextSummary = droppedCount > 0 ? updateOverflowSummary(summary, droppedCount, normalizedNow) : summary;
+  const notices = [...kept, ...(nextSummary ? [nextSummary] : [])];
+  const changed = notices.length !== state.notices.length || notices.some((entry, index) => entry.id !== state.notices[index]?.id || JSON.stringify(entry) !== JSON.stringify(state.notices[index]));
+  if (changed) {
+    const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+    await writePendingState(pendingFile, { notices }, normalizedNow);
+  }
+  return { status: "ok", retained: kept.length, dropped: droppedCount, overflowed: nextSummary?.notices_overflowed ?? 0 };
 }
 
 function normalizeIso(ts, field = "timestamp") {
@@ -717,24 +730,21 @@ export async function readNotificationDeliveryAudit(descartesPaths) {
 
 export async function deliverNotificationDecision(descartesPaths, decision, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
-  if (options.required === true) await queuePendingNotification(descartesPaths, decision, options);
+  let queued;
+  if (options.required === true) {
+    queued = await queuePendingNotification(descartesPaths, decision, options);
+    if (!noticeAttemptDue(queued, Date.parse(now))) {
+      return { status: noticeDelivered(queued) ? queued.last_status : "retry_pending", retry_after: queued.next_attempt_at };
+    }
+  }
   const config = options.config ?? await readNotificationDeliveryConfig(descartesPaths);
   const payload = normalizeNotificationPayload(decision, options);
   const append = (record) => appendDeliveryAudit(descartesPaths, record, options);
   const finish = async (record) => {
     if (options.required === true) {
-      const delivered = record?.status === "delivered";
-      const cliViewed = record?.status === "cli_only" && options.allowCliOnly === true;
-      if (delivered || cliViewed) await settlePendingNotification(descartesPaths, options.requiredNoticeId, delivered ? "delivered" : "cli_only", now);
-      else {
-        const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-        const state = await recoverNotificationOutbox(descartesPaths);
-        const entry = state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
-        if (!entry) return record;
-        entry.attempts = (entry.attempts ?? 0) + 1;
-        entry.last_status = typeof record?.status === "string" ? record.status : "error";
-        await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
-      }
+      const delivered = record?.status === "delivered" || record?.status === "cli_only";
+      if (delivered) await settlePendingNotification(descartesPaths, options.requiredNoticeId, record.status, now);
+      else await recordNotificationFailure(descartesPaths, options.requiredNoticeId, record?.status, now);
     }
     return record;
   };

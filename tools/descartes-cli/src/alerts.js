@@ -16,7 +16,7 @@ import {
   readNotificationDeliveryConfig,
   testNotificationDelivery,
   readPendingNotifications,
-  appendSeenNotification,
+  selectNotificationNoticeWindow,
   writeNotificationDeliveryConfig,
 } from "./notification-delivery.js";
 
@@ -147,13 +147,17 @@ export function visibleAlerts(alerts, options = {}) {
   return sortAlerts(alerts.filter((alert) => options.all || activeStatuses.has(alert.status)));
 }
 
-function renderPendingNotices(lines, pendingNotifications) {
-  // Odd notices never hide present alerts: only well-formed outbox entries render; the rest are counted.
-  const { entries, skipped } = filterNotificationEntries(pendingNotifications, "pending");
-  if (entries.length > 0) {
-    lines.push(`Required notices pending: ${entries.length}`);
-    for (const notice of entries) lines.push(`- pending notice: ${notice.title} [${notice.digest.slice(0, 16)}]`);
+function renderPendingNotices(lines, notificationState, now) {
+  // Rendering is always read-only. Delivery status is independent of whether an operator has viewed the row.
+  const view = selectNotificationNoticeWindow(notificationState, { now });
+  const rawEntries = Array.isArray(notificationState) ? notificationState : notificationState?.notices;
+  const skipped = filterNotificationEntries(rawEntries).skipped;
+  const pending = view.entries.filter((notice) => !["delivered", "cli_only", "skipped"].includes(notice.last_status));
+  if (view.entries.length > 0) {
+    if (pending.length > 0) lines.push(`Required notices pending: ${pending.length}`);
+    for (const notice of view.entries) lines.push(`- required notice: ${notice.title} [${notice.last_status ?? "pending"}; ${notice.digest.slice(0, 16)}]`);
   }
+  if (view.older_count > 0) lines.push(`Required notices older/overflowed: ${view.older_count}`);
   if (skipped > 0) lines.push(`Required notices skipped: ${skipped} (malformed outbox entr${skipped === 1 ? "y" : "ies"})`);
 }
 
@@ -169,13 +173,20 @@ export function renderAlertList(alerts, options = {}) {
     if (alert.acknowledged_at) lines.push(`  acknowledged_at=${alert.acknowledged_at}`);
     if (alert.delivery_failure_count > 0) lines.push(`  delivery= failing since ${alert.delivery_failing_since ?? alert.last_delivery_failure_at ?? "unknown"} (next attempt ${alert.next_attempt_at ?? "now"}; ${alert.delivery_failure_count} failure${alert.delivery_failure_count === 1 ? "" : "s"}${alert.delivery_failure_reason ? `: ${alert.delivery_failure_reason}` : ""})`);
   }
-  renderPendingNotices(lines, options.pendingNotifications);
+  renderPendingNotices(lines, options.notificationState ?? { notices: options.pendingNotifications }, options.now);
   return lines.join("\n");
 }
 
 function jsonAlertPayload(alerts, options = {}) {
-  const { entries, skipped } = filterNotificationEntries(options.pendingNotifications, "pending");
-  return { alerts: visibleAlerts(alerts, options), pending_notifications: entries, ...(skipped > 0 ? { pending_notifications_skipped: skipped } : {}) };
+  const state = options.notificationState ?? { notices: options.pendingNotifications };
+  const view = selectNotificationNoticeWindow(state, { now: options.now });
+  const pending = view.entries.filter((notice) => !["delivered", "cli_only", "skipped"].includes(notice.last_status));
+  return {
+    alerts: visibleAlerts(alerts, options),
+    required_notifications: view.entries,
+    required_notifications_older_count: view.older_count,
+    pending_notifications: pending,
+  };
 }
 
 // S13 nice-to-have: surface enabled_namespaces + critical_reservation + a corrupt-config marker,
@@ -354,10 +365,6 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     const digest = await (runtime.buildAlertDigest ?? buildAlertDigest)(descartesPaths, { now: runtime.now });
     if (options.json) output(JSON.stringify({ digest }, null, 2));
     else output(renderAlertDigest(digest));
-    // Only the notices this digest showed become seen; one queued since stays pending.
-    for (const notice of filterNotificationEntries(digest.notifications?.pending, "pending").entries) {
-      await appendSeenNotification(descartesPaths, notice.id, { now: runtime.now });
-    }
     return;
   }
 
@@ -378,14 +385,10 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     // (recovery + episode/last_notified) remains exclusively the daemon's job via
     // evaluateAndPersistAlerts with the full extraCandidates set.
     const result = await evaluateAlerts(descartesPaths, { coveredAlertIds: fixedAlertIds() });
-    const pendingNotifications = (await readPendingNotifications(descartesPaths)).pending;
-    const renderOptions = { ...options, pendingNotifications };
-    if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, renderOptions), notification_due_ids: result.notification_due_ids }, null, 2));
+    const notificationState = await readPendingNotifications(descartesPaths);
+    const renderOptions = { ...options, notificationState, now: runtime.now };
+    if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, renderOptions), notification_due_ids: result.notification_due_ids, ...(notificationState.outbox_error ? { notification_outbox_warning: notificationState.outbox_error } : {}) }, null, 2));
     else output(renderAlertList(result.alerts, renderOptions));
-    // Only the notices this view rendered become seen; one queued since stays pending.
-    for (const notice of filterNotificationEntries(pendingNotifications, "pending").entries) {
-      await appendSeenNotification(descartesPaths, notice.id, { now: runtime.now });
-    }
   };
 
   if (options.subcommand === "list") {

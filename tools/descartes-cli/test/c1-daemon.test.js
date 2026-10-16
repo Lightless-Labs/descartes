@@ -10,6 +10,7 @@ import { runDaemonIteration } from "../src/daemon.js";
 import { readAlertRecords } from "../src/alert-store.js";
 import { readAlertTransitions } from "../src/alert-transitions.js";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { resolveNotificationDeliveryPaths } from "../src/notification-delivery.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-c1-daemon-test-"));
@@ -55,6 +56,23 @@ test("a transition-log failure never affects alerting", async () => {
   const results = await runTicks(paths, [0.95, 0.95, 0.95], { extra: { recordAlertTransitions: async () => { throw new Error("ENOSPC: no space left"); } } });
   assert.equal(results.at(-1).alertTransitions.status, "error");
   assert.ok((await readAlertRecords(paths)).some((alert) => alert.rule_id === "system.memory.sustained_high" && alert.status === "active"));
+});
+
+test("an unreadable notification outbox leaves the tick warning and the path unchanged", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.mkdir(pendingFile);
+  const result = await runDaemonIteration(paths, {
+    collectors: collectorsWithMemory(0.1),
+    ts: "2026-10-12T00:00:00.000Z",
+    now: "2026-10-12T00:00:00.000Z",
+    deliverNotification: async () => ({ status: "cli_only" }),
+  });
+  assert.equal(result.notificationOutbox.status, "warning");
+  assert.equal(result.notificationOutbox.error.code, "EISDIR");
+  assert.equal(result.status.state, "error");
+  assert.equal((await fs.stat(pendingFile)).isDirectory(), true);
 });
 
 test("closure integrity audit is recorded before a delivery exception", async () => {

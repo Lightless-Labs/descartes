@@ -41,7 +41,7 @@ export async function journalWitness(descartesPaths, family) {
 // (the pre-pass, or label ingestion opening a journal on its own) sends it.
 // A delivery that returned a failure status was not notified (review L2). No per-notice retry is kept
 // across ticks: the digest lists every open epoch and retries its own push until it is delivered.
-const FAILED_DELIVERY_STATUSES = new Set(["error", "unavailable", "disabled", "cli_only"]);
+const FAILED_DELIVERY_STATUSES = new Set(["error", "unavailable", "disabled", "retry_pending"]);
 
 export function notificationOutcome(result) {
   const status = typeof result?.status === "string" ? result.status : null;
@@ -49,14 +49,14 @@ export function notificationOutcome(result) {
   return { notified: true, notify_status: status };
 }
 
-export async function deliverPendingDiscontinuityNotice(descartesPaths, { family, cause, ts, deliverNotification } = {}) {
+export async function deliverPendingDiscontinuityNotice(descartesPaths, { family, epoch, cause, ts, deliverNotification } = {}) {
   try {
     const result = await (deliverNotification ?? deliverNotificationDecision)(descartesPaths, {
       notify: true,
       severity: "warning",
       title: "Descartes: pending journal discontinuity",
-      body: `The ${family} pending journal lost continuity (${cause}); unattended admission is suspended for it until re-certification. Detection is unaffected.`,
-    }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID, required: true, requiredNoticeId: `${PENDING_DISCONTINUITY_NOTICE_ID}:${family}:${cause}` });
+      body: `The ${family} pending journal lost continuity in epoch ${epoch ?? "unknown"} (${cause}); unattended admission is suspended for it until re-certification. Detection is unaffected.`,
+    }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID, required: true, requiredNoticeId: `${PENDING_DISCONTINUITY_NOTICE_ID}:${family}:epoch:${epoch ?? "unknown"}:${cause}` });
     return notificationOutcome(result);
   } catch (error) {
     // The required notice may never have reached the outbox (for example, daemon persistence failed):
@@ -72,7 +72,7 @@ export async function deliverPendingJournalNotices(descartesPaths, prePass, { ts
   for (const [family, result] of Object.entries(prePass?.families ?? {})) {
     const report = result?.report;
     if (!report?.discontinuity) continue;
-    const outcome = await deliverPendingDiscontinuityNotice(descartesPaths, { family, cause: report.discontinuity.cause, ts, deliverNotification });
+    const outcome = await deliverPendingDiscontinuityNotice(descartesPaths, { family, epoch: report.discontinuity.epoch, cause: report.discontinuity.cause, ts, deliverNotification });
     Object.assign(report, outcome);
     outcomes.push({ family, ...outcome });
   }

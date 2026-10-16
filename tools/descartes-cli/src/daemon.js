@@ -8,7 +8,7 @@ import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricA
 import { readVerifiedAlertTransitions, reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
-import { deliverNotificationDecision, foldNotificationSeenLog } from "./notification-delivery.js";
+import { deliverNotificationDecision, recoverNotificationOutbox, retainNotificationOutbox } from "./notification-delivery.js";
 import { deliverPendingDiscontinuityNotice, deliverPendingJournalNotices, finishPendingJournalTick, notificationOutcome, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID, writeAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
@@ -1188,15 +1188,23 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
-  let notificationSeen;
+  let notificationOutbox;
   try {
-    notificationSeen = await foldNotificationSeenLog(descartesPaths, {
-      now: ts,
-      beforeRotate: options.beforeNotificationSeenRotate,
-    });
+    const recovered = await recoverNotificationOutbox(descartesPaths);
+    if (recovered.outbox_error) {
+      notificationOutbox = { status: "warning", error: recovered.outbox_error, changed: false };
+    } else {
+      const retention = await retainNotificationOutbox(descartesPaths, { now: ts });
+      notificationOutbox = {
+        status: recovered.recovered || retention.status === "warning" ? "warning" : "ok",
+        ...(recovered.recovered ? { recovery: "corrupt_outbox_quarantined" } : {}),
+        ...(retention.status === "warning" ? { error: retention.outbox_error } : {}),
+        ...(retention.dropped > 0 ? { dropped: retention.dropped, overflowed: retention.overflowed } : {}),
+      };
+    }
   } catch (error) {
-    notificationSeen = { status: "error", error: error instanceof Error ? error.message : String(error) };
-    console.warn(`[daemon] notification seen-log fold failed (${notificationSeen.error}); it remains for the next tick`);
+    notificationOutbox = { status: "warning", error: error instanceof Error ? error.message : String(error), changed: false };
+    console.warn(`[daemon] notification outbox maintenance failed (${notificationOutbox.error}); it remains unchanged`);
   }
   try {
     await fs.unlink(path.join(descartesPaths.stateDir, "daemon", LEGACY_CONTENT_PIN_FILE));
@@ -2123,7 +2131,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const retentionError = combineErrors(write.retention_error, structuralFacts?.retention_error);
   const statusRecord = {
     ts,
-    state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure ? "error" : "ok",
+    state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure || notificationOutbox?.status === "warning" ? "error" : "ok",
     mode: options.mode ?? "foreground",
     profile,
     collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),
@@ -2143,6 +2151,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(factStoreDeprecations.length > 0 ? { fact_store_deprecations: factStoreDeprecations } : {}),
     ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
     ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
+    ...(notificationOutbox ? { notification_outbox: notificationOutbox } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
     // property, so it is unconditional here (unlike the ...(x ? {...} : {}) spreads above, which
     // are conditional on genuinely-computed-this-tick evidence). Display/disclosure only -- see
@@ -2542,8 +2551,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       const handles = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).filter(([, result]) => result.handle).map(([family, result]) => [family, result.handle]));
       const ledgers = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).map(([family, result]) => [family, result.ledger ?? null]));
       labelIngestion = await (options.ingestAlertLabels ?? ingestAlertLabels)(descartesPaths, { now: ts, handles, ledgers, transitionLog: verifiedTransitionLog });
-      for (const { family, cause } of labelIngestion?.discontinuities ?? []) {
-        await deliverPendingDiscontinuityNotice(descartesPaths, { family, cause, ts, deliverNotification: options.deliverNotification });
+      for (const { family, epoch, cause } of labelIngestion?.discontinuities ?? []) {
+        await deliverPendingDiscontinuityNotice(descartesPaths, { family, epoch, cause, ts, deliverNotification: options.deliverNotification });
       }
       if (labelIngestion?.notice) {
         try {
@@ -2647,7 +2656,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       pendingJournal = { status: "error", error: error instanceof Error ? error.message : String(error) };
     }
   }
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion, alertDigest, notificationSeen };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion, alertDigest, notificationOutbox };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

@@ -106,10 +106,10 @@ test("alert list renderer skips odd pending notices and counts them without hidi
     title: "Present alert",
     first_seen: "2026-05-28T00:00:00.000Z",
     last_seen: "2026-05-28T00:00:00.000Z",
-  }], { pendingNotifications: [null, { id: "notice", title: "Notice", digest: "a".repeat(64), rule_id: "integrity.test", first_seen_at: "2026-05-28T00:00:00.000Z", severity: "warning", body: "Body", attempts: 0, last_status: null }, { title: 7 }] });
+  }], { now: "2026-05-28T01:00:00.000Z", pendingNotifications: [null, { id: "notice", title: "Notice", digest: "a".repeat(64), rule_id: "integrity.test", first_seen_at: "2026-05-28T00:00:00.000Z", severity: "warning", body: "Body", attempts: 0, last_status: null }, { title: 7 }] });
   assert.match(output, /alert_present/);
   assert.match(output, /Required notices pending: 1/);
-  assert.match(output, /pending notice: Notice/);
+  assert.match(output, /required notice: Notice/);
   assert.match(output, /Required notices skipped: 2/);
 });
 

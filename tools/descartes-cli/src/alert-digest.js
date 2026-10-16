@@ -16,7 +16,7 @@ import { resolveAlertLabelPaths } from "./alert-labels.js";
 import { atomicWrite } from "./hash-chain.js";
 import { readFactIntegrityLedger } from "./fact-store-integrity.js";
 import { inspectPendingJournal, PENDING_JOURNAL_FAMILIES, pendingAdmissionStatus } from "./pending-journal.js";
-import { deliverNotificationDecision, filterNotificationEntries, queuePendingNotification, readPendingNotifications, resolvePendingNotification } from "./notification-delivery.js";
+import { deliverNotificationDecision, queuePendingNotification, readPendingNotifications, resolvePendingNotification, selectNotificationNoticeWindow } from "./notification-delivery.js";
 
 // §16.1 (O): the digest period. Default daily, sent only when not empty.
 export const DIGEST_PERIOD_MS = 24 * 60 * 60 * 1000;
@@ -59,6 +59,8 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
   const sinceIso = new Date(since ?? state?.last_period_end ?? (Date.parse(nowIso) - DIGEST_PERIOD_MS)).toISOString();
   const inPeriod = (ts) => ts > sinceIso && ts <= nowIso;
   const [alerts, transitions, pendingNotifications] = await Promise.all([readAlertRecords(descartesPaths), readAlertTransitions(descartesPaths), readPendingNotifications(descartesPaths)]);
+  const notificationWindow = selectNotificationNoticeWindow(pendingNotifications, { now: nowIso });
+  const pendingNoticeEntries = notificationWindow.entries.filter((entry) => !["delivered", "cli_only", "skipped"].includes(entry.last_status));
   const alertsById = new Map(alerts.map((alert) => [alert.id, alert]));
   const records = transitions.records.filter((record) => typeof record.ts === "string" && inPeriod(record.ts));
   const byKind = (...kinds) => records.filter((record) => kinds.includes(record.kind));
@@ -142,8 +144,12 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
       journals: Object.entries(journals).filter(([, journal]) => journal.status !== "valid").map(([family, journal]) => ({ family, status: journal.status, cause: journal.cause ?? null })),
     },
     notifications: {
-      pending: filterNotificationEntries(pendingNotifications.pending, "pending").entries,
+      notices: notificationWindow.entries,
+      pending: pendingNoticeEntries,
+      older_count: notificationWindow.older_count,
+      overflowed_count: notificationWindow.overflowed_count,
       ...(pendingNotifications.tamper ? { corrupt: true } : {}),
+      ...(pendingNotifications.outbox_error ? { warning: pendingNotifications.outbox_error } : {}),
     },
   };
   digest.counts = {
@@ -159,6 +165,8 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
     unadjudicated: digest.unadjudicated.length,
     integrity: integrity.length + digest.integrity.transition_log.gaps.length + digest.integrity.journals.length,
     notifications_pending: digest.notifications.pending.length,
+    notifications_recent: digest.notifications.notices.length,
+    notifications_older: digest.notifications.older_count,
   };
   digest.empty = Object.values(digest.counts).every((count) => count === 0) && digest.admission_suspended.length === 0 && digest.tombstones_dropped.length === 0;
   return digest;
@@ -190,6 +198,7 @@ export function renderAlertDigest(digest) {
   }
   lines.push(digestSummaryLine(digest));
   if (digest.notifications?.corrupt) lines.push("- WARNING: notification outbox is corrupt; the daemon will quarantine and recover it on its next tick.");
+  if (digest.notifications?.warning) lines.push(`- WARNING: notification outbox could not be read (${digest.notifications.warning.message}); the daemon left it unchanged and will retry.`);
   for (const closure of digest.closures) lines.push(`- closed ${closure.alert_id}${closure.incident_key ? `/${closure.incident_key}` : ""} (${closure.reason ?? "unknown"}${closure.source?.ref ? `, ${closure.source.kind} ${closure.source.ref}` : ""})`);
   for (const label of digest.labels.ingested) lines.push(`- label ${label.label} ${label.label_id} (charge ${label.charge}, ${label.effect})`);
   for (const held of digest.labels.held) lines.push(`- label ${held.label_id} held over budget since ${held.held_at} (charge ${held.charge})`);
@@ -201,7 +210,8 @@ export function renderAlertDigest(digest) {
   for (const entry of digest.admission_suspended) lines.push(`- ${entry.family}: unattended admission suspended (${entry.reason})`);
   for (const gap of digest.integrity.transition_log.gaps) lines.push(`- transition log ${gap.kind}${gap.reason ? ` (${gap.reason})` : ""} at ${gap.ts}`);
   for (const notice of digest.integrity.active_notices) lines.push(`- integrity notice active: ${notice.rule_id}`);
-  for (const notice of filterNotificationEntries(digest.notifications?.pending, "pending").entries) lines.push(`- required notification pending: ${notice.title} [${notice.digest.slice(0, 16)}]`);
+  for (const notice of digest.notifications?.notices ?? []) lines.push(`- required notification ${notice.last_status ?? "pending"}: ${notice.title} [${notice.digest.slice(0, 16)}]`);
+  if ((digest.notifications?.older_count ?? 0) > 0) lines.push(`- required notifications older/overflowed: ${digest.notifications.older_count}`);
   return lines.join("\n");
 }
 

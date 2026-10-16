@@ -26,6 +26,7 @@ import {
   unscoredPasses,
 } from "../src/pending-journal.js";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { deliverPendingDiscontinuityNotice } from "../src/pending-journal-daemon.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-pending-journal-test-"));
@@ -551,6 +552,21 @@ test("the pre-pass never delivers; discontinuity notices go out after detection 
   const delivered = await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => ({ status: "delivered" }) });
   assert.equal(delivered.length, 1);
   assert.equal(prePass.families.session.report.notified, true);
+});
+
+test("discontinuity notice identity includes the journal epoch", async () => {
+  const paths = await tempPaths();
+  const ids = [];
+  const deliverNotification = async (_paths, _decision, options) => {
+    ids.push(options.requiredNoticeId);
+    return { status: "delivered" };
+  };
+  await deliverPendingDiscontinuityNotice(paths, { family: FAMILY, epoch: 7, cause: "chain_broken", ts: iso(1), deliverNotification });
+  await deliverPendingDiscontinuityNotice(paths, { family: FAMILY, epoch: 8, cause: "chain_broken", ts: iso(2), deliverNotification });
+  assert.deepEqual(ids, [
+    "integrity.pending_discontinuity:session:epoch:7:chain_broken",
+    "integrity.pending_discontinuity:session:epoch:8:chain_broken",
+  ]);
 });
 
 test("a discontinuity notice that cannot even be queued is loud: warned and carried into the tick summary", async (t) => {
