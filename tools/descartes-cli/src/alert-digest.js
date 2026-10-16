@@ -58,8 +58,6 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
   const state = await readJsonOrNull(resolveAlertDigestPaths(descartesPaths).stateFile);
   const sinceIso = new Date(since ?? state?.last_period_end ?? (Date.parse(nowIso) - DIGEST_PERIOD_MS)).toISOString();
   const inPeriod = (ts) => ts > sinceIso && ts <= nowIso;
-  // readPendingNotifications is the one exception to read-only: a corrupt outbox is quarantined and
-  // replaced (with a pending integrity notice) so the digest reports it instead of failing.
   const [alerts, transitions, pendingNotifications] = await Promise.all([readAlertRecords(descartesPaths), readAlertTransitions(descartesPaths), readPendingNotifications(descartesPaths)]);
   const alertsById = new Map(alerts.map((alert) => [alert.id, alert]));
   const records = transitions.records.filter((record) => typeof record.ts === "string" && inPeriod(record.ts));
@@ -143,7 +141,10 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
       transition_log: { status: transitions.status, gaps: byKind("chain_restart", "rebaselined").map((record) => ({ ts: record.ts, kind: record.kind, reason: record.reason ?? null })) },
       journals: Object.entries(journals).filter(([, journal]) => journal.status !== "valid").map(([family, journal]) => ({ family, status: journal.status, cause: journal.cause ?? null })),
     },
-    notifications: { pending: filterNotificationEntries(pendingNotifications.pending, "pending").entries },
+    notifications: {
+      pending: filterNotificationEntries(pendingNotifications.pending, "pending").entries,
+      ...(pendingNotifications.tamper ? { corrupt: true } : {}),
+    },
   };
   digest.counts = {
     admissions: digest.admissions.length,
@@ -188,6 +189,7 @@ export function renderAlertDigest(digest) {
     return lines.join("\n");
   }
   lines.push(digestSummaryLine(digest));
+  if (digest.notifications?.corrupt) lines.push("- WARNING: notification outbox is corrupt; the daemon will quarantine and recover it on its next tick.");
   for (const closure of digest.closures) lines.push(`- closed ${closure.alert_id}${closure.incident_key ? `/${closure.incident_key}` : ""} (${closure.reason ?? "unknown"}${closure.source?.ref ? `, ${closure.source.kind} ${closure.source.ref}` : ""})`);
   for (const label of digest.labels.ingested) lines.push(`- label ${label.label} ${label.label_id} (charge ${label.charge}, ${label.effect})`);
   for (const held of digest.labels.held) lines.push(`- label ${held.label_id} held over budget since ${held.held_at} (charge ${held.charge})`);

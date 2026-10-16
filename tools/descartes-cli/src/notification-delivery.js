@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { atomicWrite, canonicalJson } from "./hash-chain.js";
-import { throwIfCollectorAborted } from "./tools/collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +22,8 @@ export function resolveNotificationDeliveryPaths(descartesPaths) {
     auditDir: alertsDir,
     auditFile: path.join(alertsDir, "notification-delivery.jsonl"),
     pendingFile: path.join(alertsDir, "notification-pending.json"),
+    seenFile: path.join(alertsDir, "notification-seen.jsonl"),
+    seenCursorFile: path.join(alertsDir, "notification-seen.cursor.json"),
   };
 }
 
@@ -58,165 +59,7 @@ export function filterNotificationEntries(entries, section = "pending") {
   return { entries: valid, skipped };
 }
 
-// Every outbox read-modify-write (queue, settle, view, attempt bookkeeping, corruption recovery)
-// runs under one cooperative lock file, so a writer never acts on a stale read: recovery re-reads
-// under the lock before quarantining, and concurrent queues/views never lose each other's notices.
-// Cooperative only: a same-UID writer that ignores the lock is out of scope (evidence boundary).
-//
-// Lock files are created complete (content written to a temp file, then link()ed into place, which
-// fails if the lock exists), so a lock is never empty. Liveness is judged from the content a waiter
-// observed, never from a re-read. Breaking a stale lock happens only under a second "break" lock and
-// only after re-reading the exact observed content, so two breakers cannot remove each other's fresh
-// lock. A holder's release needs no break lock (and never waits): it removes only its own token, and
-// a breaker never removes a live holder's lock, so release and break cannot target the same lock.
-//
-// A lock held by a LIVE process is never broken, however old (an unfenced lease would let a paused
-// holder resume and overwrite a newer writer). It is stale only when its holder is dead, or when the
-// live process at that pid started after the lock was taken (pid reuse; checked with `ps` only once
-// a lock is old). A waiter blocked by a live holder fails loudly after a bounded wait instead.
-const OUTBOX_LOCK_REUSE_CHECK_MS = 30_000;
-const OUTBOX_LOCK_MAX_WAIT_MS = 120_000;
-const OUTBOX_LOCK_REUSE_SLACK_MS = 5_000;
-
-function lockHolder(content) {
-  try {
-    const holder = JSON.parse(content);
-    return holder && typeof holder === "object" && !Array.isArray(holder) ? holder : null;
-  } catch {
-    return null;
-  }
-}
-
-function lockPidAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
-
-async function readLockContent(lockFile) {
-  try {
-    return await fs.readFile(lockFile, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function createLockFile(lockFile, content) {
-  const tmp = `${lockFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tmp, content, { mode: 0o600 });
-  try {
-    await fs.link(tmp, lockFile);
-  } finally {
-    await fs.unlink(tmp).catch(() => {});
-  }
-}
-
-function parseElapsedMs(etime) {
-  const match = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(String(etime));
-  if (!match) return null;
-  const [, days = "0", hours = "0", minutes, seconds] = match;
-  return (((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000;
-}
-
-/** True when the live process now at `pid` started after `atIso` (so it cannot be the lock's holder). */
-async function lockPidReused(pid, atIso, { signal } = {}) {
-  const at = Date.parse(atIso);
-  if (!Number.isFinite(at)) return false;
-  try {
-    throwIfCollectorAborted(signal);
-    const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
-    const elapsedMs = parseElapsedMs(stdout);
-    if (elapsedMs === null) return false;
-    return Date.now() - elapsedMs > at + OUTBOX_LOCK_REUSE_SLACK_MS;
-  } catch {
-    return false;
-  }
-}
-
-async function lockIsStale(observed, ageMs) {
-  const holder = lockHolder(observed);
-  const alive = lockPidAlive(holder?.pid);
-  if (alive === false) return true;
-  if (alive === true && ageMs > OUTBOX_LOCK_REUSE_CHECK_MS) return lockPidReused(holder.pid, holder.at);
-  return false;
-}
-
-async function acquireLockFile(lockFile, token, breakStale, { maxWaitMs = OUTBOX_LOCK_MAX_WAIT_MS } = {}) {
-  const content = JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() });
-  const started = Date.now();
-  let delayMs = 2;
-  let reuseChecked;
-  for (;;) {
-    try {
-      await createLockFile(lockFile, content);
-      return;
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-    }
-    const observed = await readLockContent(lockFile);
-    if (observed === undefined) continue;
-    let ageMs;
-    try {
-      ageMs = Date.now() - (await fs.stat(lockFile)).mtimeMs;
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
-      throw error;
-    }
-    // The pid-reuse probe spawns `ps`; run it at most once per observed lock.
-    const probeReuse = ageMs > OUTBOX_LOCK_REUSE_CHECK_MS && reuseChecked !== observed;
-    if (probeReuse) reuseChecked = observed;
-    if (lockPidAlive(lockHolder(observed)?.pid) === false || (probeReuse && await lockIsStale(observed, ageMs))) {
-      await breakStale(observed);
-      continue;
-    }
-    if (Date.now() - started > maxWaitMs) {
-      const holder = lockHolder(observed);
-      throw new Error(`notification outbox lock held by live pid ${holder?.pid ?? "unknown"} since ${holder?.at ?? "unknown"}; not breaking it (${lockFile})`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    delayMs = Math.min(delayMs * 2, 50);
-  }
-}
-
-async function removeLockIf(lockFile, predicate) {
-  const current = await readLockContent(lockFile);
-  if (current !== undefined && predicate(current)) {
-    await fs.unlink(lockFile).catch((error) => {
-      if (error?.code !== "ENOENT") throw error;
-    });
-  }
-}
-
-// Serializes stale-lock breaking. Its own stale break is unserialized (residual: a break lock left by a
-// crashed process can be removed concurrently by two breakers; this needs that crash plus a three-way
-// race).
-async function withOutboxBreakLock(lockFile, fn) {
-  const breakFile = `${lockFile}.break`;
-  const token = crypto.randomUUID();
-  await acquireLockFile(breakFile, token, (observed) => removeLockIf(breakFile, (current) => current === observed));
-  try {
-    return await fn();
-  } finally {
-    await removeLockIf(breakFile, (current) => lockHolder(current)?.token === token);
-  }
-}
-
-async function withOutboxLock(pendingFile, fn, { maxWaitMs } = {}) {
-  const lockFile = `${pendingFile}.lock`;
-  await ensureParent(lockFile);
-  const token = crypto.randomUUID();
-  await acquireLockFile(lockFile, token, (observed) => withOutboxBreakLock(lockFile, () => removeLockIf(lockFile, (current) => current === observed)), { maxWaitMs });
-  try {
-    return await fn();
-  } finally {
-    await removeLockIf(lockFile, (current) => lockHolder(current)?.token === token);
-  }
-}
+// The daemon is the only outbox writer. CLI processes append seen marks to the separate log below.
 
 async function parseOutbox(pendingFile) {
   let text;
@@ -246,8 +89,9 @@ function unrecoveredOutbox(message, now) {
   return { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message } };
 }
 
-/** Must hold the outbox lock. Re-reads; a still-corrupt outbox is quarantined and replaced. */
-async function loadOutboxLocked(pendingFile) {
+/** The daemon re-reads, quarantines, and replaces a corrupt outbox. */
+export async function recoverNotificationOutbox(descartesPaths) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const now = new Date().toISOString();
   const read = await parseOutbox(pendingFile);
   if (read.state) return read.state;
@@ -270,19 +114,14 @@ async function loadOutboxLocked(pendingFile) {
 /**
  * Reads the required-notice outbox. Every entry in pending/seen/resolved must have the full outbox
  * record shape; a parseable-but-malformed outbox is as corrupt as invalid JSON. A corrupt outbox is
- * quarantined (renamed aside, under the outbox lock, after a re-read) and replaced by a fresh valid
- * outbox holding a pending integrity notice, so callers only ever see well-formed entries. This is
- * the one write a read may make.
+ * reported in memory as a pending integrity notice. It never writes, renames, or quarantines; the
+ * daemon calls recoverNotificationOutbox on its next tick.
  */
 export async function readPendingNotifications(descartesPaths) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const read = await parseOutbox(pendingFile);
   if (read.state) return read.state;
-  try {
-    return await withOutboxLock(pendingFile, () => loadOutboxLocked(pendingFile));
-  } catch (lockError) {
-    return unrecoveredOutbox(`${read.error?.message ?? String(read.error)}; recovery failed: ${lockError?.message ?? String(lockError)}`, new Date().toISOString());
-  }
+  return unrecoveredOutbox(read.error?.message ?? String(read.error), new Date().toISOString());
 }
 
 function pendingNoticeDigest(decision, options = {}) {
@@ -325,81 +164,189 @@ export async function queuePendingNotification(descartesPaths, decision, options
   if (!options.requiredNoticeId) throw new Error("required notification needs requiredNoticeId");
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
-  return withOutboxLock(pendingFile, async () => {
-    let state = await loadOutboxLocked(pendingFile);
-    if (state.tamper && !state.recovered) {
-      const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
-      await fs.rename(pendingFile, quarantine).catch((error) => {
-        if (error?.code !== "ENOENT") throw error;
-      });
-      state = { v: 1, pending: [outboxIntegrityEntry("corrupt", state.tamper.message, now)], seen: [], resolved: [] };
+  await ensureParent(pendingFile);
+  let state = await recoverNotificationOutbox(descartesPaths);
+  const payload = normalizeNotificationPayload(decision, options);
+  const id = String(options.requiredNoticeId);
+  const existing = state.pending.find((entry) => entry.id === id);
+  const entry = existing ?? {
+    id,
+    digest: pendingNoticeDigest(decision, options),
+    rule_id: options.ruleId === undefined || options.ruleId === null ? null : String(options.ruleId),
+    first_seen_at: now,
+    severity: payload.severity,
+    title: payload.title,
+    body: payload.body,
+    attempts: 0,
+    last_status: null,
+  };
+  if (!existing) {
+    const summary = state.pending.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
+    if (state.pending.length < MAX_PENDING_NOTIFICATIONS) {
+      state.pending.push(entry);
+    } else if (summary) {
+      state.pending = state.pending.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+      state.pending.push(updateOverflowSummary(summary, 1, now));
+    } else {
+      const displaced = Math.max(1, state.pending.length - (MAX_PENDING_NOTIFICATIONS - 1));
+      state.pending = state.pending.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+      state.pending.push(updateOverflowSummary(undefined, displaced + 1, now));
     }
-    const payload = normalizeNotificationPayload(decision, options);
-    const id = String(options.requiredNoticeId);
-    const existing = state.pending.find((entry) => entry.id === id);
-    const entry = existing ?? {
-      id,
-      digest: pendingNoticeDigest(decision, options),
-      rule_id: options.ruleId === undefined || options.ruleId === null ? null : String(options.ruleId),
-      first_seen_at: now,
-      severity: payload.severity,
-      title: payload.title,
-      body: payload.body,
-      attempts: 0,
-      last_status: null,
-    };
-    if (!existing) {
-      const summary = state.pending.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
-      if (state.pending.length < MAX_PENDING_NOTIFICATIONS) {
-        state.pending.push(entry);
-      } else if (summary) {
-        state.pending = state.pending.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
-        state.pending.push(updateOverflowSummary(summary, 1, now));
-      } else {
-        const displaced = Math.max(1, state.pending.length - (MAX_PENDING_NOTIFICATIONS - 1));
-        state.pending = state.pending.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
-        state.pending.push(updateOverflowSummary(undefined, displaced + 1, now));
-      }
-    }
-    await writePendingState(pendingFile, state, now);
-    return existing ?? entry;
-  }, { maxWaitMs: options.lockWaitMs });
+  }
+  await writePendingState(pendingFile, state, now);
+  return existing ?? entry;
 }
 
 async function settlePendingNotification(descartesPaths, id, status, now) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  return withOutboxLock(pendingFile, async () => {
-    const state = await loadOutboxLocked(pendingFile);
-    if (state.tamper && !state.recovered) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
-    const index = state.pending.findIndex((entry) => entry.id === id);
-    if (index < 0) return;
-    const [entry] = state.pending.splice(index, 1);
-    state.resolved.push({ ...entry, resolved_at: normalizeIso(now, "resolved_at"), resolution: String(status || "resolved") });
-    await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
-  });
+  const state = await recoverNotificationOutbox(descartesPaths);
+  const index = state.pending.findIndex((entry) => entry.id === id);
+  if (index < 0) return;
+  const [entry] = state.pending.splice(index, 1);
+  state.resolved.push({ ...entry, resolved_at: normalizeIso(now, "resolved_at"), resolution: String(status || "resolved") });
+  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
 }
 
 export async function resolvePendingNotification(descartesPaths, id, status, now = new Date().toISOString()) {
   return settlePendingNotification(descartesPaths, id, status, now);
 }
 
-/** Marks pending notices seen. `ids`, when given, limits this to the notices the caller rendered, so a
- * notice queued after the render stays pending. */
-export async function viewPendingNotifications(descartesPaths, { now = new Date().toISOString(), ids } = {}) {
-  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  return withOutboxLock(pendingFile, async () => {
-    const state = await loadOutboxLocked(pendingFile);
-    // An unrecovered corrupt outbox is left in place for a writer to quarantine; never overwrite it here.
-    if (state.tamper && !state.recovered) return [];
-    const shown = ids === undefined ? null : new Set(ids);
-    const pending = state.pending.filter((entry) => shown === null || shown.has(entry.id));
-    if (pending.length === 0) return [];
-    const remaining = state.pending.filter((entry) => !pending.includes(entry));
-    const seenAt = normalizeIso(now, "seen_at");
-    const viewed = pending.map((entry) => ({ ...entry, seen_at: seenAt, resolution: "viewed" }));
-    await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: remaining, seen: [...state.seen, ...viewed].slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
-    return viewed;
-  });
+const MAX_SEEN_MARK_ID_LENGTH = 512;
+const MAX_SEEN_MARK_LINE_BYTES = 4096;
+
+function normalizeSeenMark(mark) {
+  if (!mark || typeof mark !== "object" || Array.isArray(mark) || mark.v !== 1) return undefined;
+  if (typeof mark.id !== "string" || mark.id.length === 0 || mark.id.length > MAX_SEEN_MARK_ID_LENGTH) return undefined;
+  if (!isIsoString(mark.seen_at)) return undefined;
+  return { v: 1, id: mark.id, seen_at: new Date(mark.seen_at).toISOString() };
+}
+
+/** CLI writers append one bounded JSON line. The daemon is the sole consumer and outbox writer. */
+export async function appendSeenNotification(descartesPaths, id, { now = new Date().toISOString() } = {}) {
+  const { seenFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const mark = normalizeSeenMark({ v: 1, id: String(id), seen_at: normalizeIso(now, "seen_at") });
+  if (!mark) throw new Error("invalid notification seen mark");
+  const line = Buffer.from(`${JSON.stringify(mark)}\n`);
+  if (line.byteLength > MAX_SEEN_MARK_LINE_BYTES) throw new Error("notification seen mark exceeds PIPE_BUF-safe line size");
+  await ensureParent(seenFile);
+  const handle = await fs.open(seenFile, fsSync.constants.O_APPEND | fsSync.constants.O_CREAT | fsSync.constants.O_WRONLY, 0o600);
+  try {
+    const written = await handle.write(line, 0, line.byteLength);
+    if (written.bytesWritten !== line.byteLength) throw new Error("notification seen mark was only partially appended");
+  } finally {
+    await handle.close();
+  }
+  return mark;
+}
+
+function seenArchiveName(name) {
+  return /^notification-seen\.jsonl\.consumed-[0-9]+-[0-9a-f-]+$/.test(name);
+}
+
+async function readSeenCursor(file) {
+  try {
+    const cursor = JSON.parse(await fs.readFile(file, "utf8"));
+    return cursor?.v === 1 && cursor.files && typeof cursor.files === "object" ? cursor.files : {};
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    return {};
+  }
+}
+
+async function writeSeenCursor(file, files) {
+  await atomicWrite(file, JSON.stringify({ v: 1, files }));
+}
+
+async function seenFiles(descartesPaths) {
+  const { seenFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const dir = path.dirname(seenFile);
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  return [
+    ...(entries.some((entry) => entry.isFile() && entry.name === path.basename(seenFile)) ? [seenFile] : []),
+    ...entries.filter((entry) => entry.isFile() && seenArchiveName(entry.name)).map((entry) => path.join(dir, entry.name)).sort(),
+  ];
+}
+
+function fileIdentity(stat) {
+  return { dev: Number(stat.dev), ino: Number(stat.ino) };
+}
+
+async function readNewSeenMarks(file, cursor) {
+  let stat;
+  try {
+    stat = await fs.stat(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { marks: [], malformed: 0, next: undefined };
+    throw error;
+  }
+  const identity = fileIdentity(stat);
+  const prior = cursor?.dev === identity.dev && cursor?.ino === identity.ino && Number.isSafeInteger(cursor.offset) && cursor.offset <= stat.size
+    ? cursor.offset
+    : 0;
+  const bytes = await fs.readFile(file);
+  let consumed = prior;
+  const marks = [];
+  let malformed = 0;
+  while (consumed < bytes.length) {
+    const newline = bytes.indexOf(10, consumed);
+    if (newline < 0) break;
+    const line = bytes.subarray(consumed, newline).toString("utf8");
+    consumed = newline + 1;
+    try {
+      const mark = normalizeSeenMark(JSON.parse(line));
+      if (mark) marks.push(mark);
+      else malformed += 1;
+    } catch {
+      malformed += 1;
+    }
+  }
+  return { marks, malformed, next: { ...identity, offset: consumed } };
+}
+
+/** Fold CLI marks into the daemon-owned outbox, then checkpoint and rotate consumed log bytes. */
+export async function foldNotificationSeenLog(descartesPaths, { now = new Date().toISOString(), beforeRotate } = {}) {
+  const { pendingFile, seenCursorFile, seenFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  await ensureParent(seenFile);
+  const cursor = await readSeenCursor(seenCursorFile);
+  const files = await seenFiles(descartesPaths);
+  const marks = [];
+  let malformed = 0;
+  const nextCursor = {};
+  for (const file of files) {
+    const result = await readNewSeenMarks(file, cursor[file]);
+    marks.push(...result.marks);
+    malformed += result.malformed;
+    if (result.next) nextCursor[file] = result.next;
+  }
+  const state = await recoverNotificationOutbox(descartesPaths);
+  const seenIds = new Set();
+  for (const mark of marks) {
+    const index = state.pending.findIndex((entry) => entry.id === mark.id);
+    if (index < 0 || seenIds.has(mark.id)) continue;
+    const [entry] = state.pending.splice(index, 1);
+    state.seen.push({ ...entry, seen_at: mark.seen_at, resolution: "viewed" });
+    seenIds.add(mark.id);
+  }
+  if (seenIds.size > 0) await writePendingState(pendingFile, state, normalizeIso(now, "now"));
+  await writeSeenCursor(seenCursorFile, nextCursor);
+  await beforeRotate?.();
+  const active = nextCursor[seenFile];
+  if (active && active.offset > 0) {
+    const archive = `${seenFile}.consumed-${Date.now()}-${crypto.randomUUID()}`;
+    await fs.rename(seenFile, archive);
+    await fs.writeFile(seenFile, "", { flag: "a", mode: 0o600 });
+    nextCursor[archive] = active;
+    const newStat = await fs.stat(seenFile);
+    nextCursor[seenFile] = { ...fileIdentity(newStat), offset: 0 };
+    await writeSeenCursor(seenCursorFile, nextCursor);
+  }
+  return { seen: seenIds.size, malformed, marks: marks.length };
 }
 
 async function ensureParent(file) {
@@ -781,14 +728,12 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
       if (delivered || cliViewed) await settlePendingNotification(descartesPaths, options.requiredNoticeId, delivered ? "delivered" : "cli_only", now);
       else {
         const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-        await withOutboxLock(pendingFile, async () => {
-          const state = await loadOutboxLocked(pendingFile);
-          const entry = state.tamper && !state.recovered ? undefined : state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
-          if (!entry) return;
-          entry.attempts = (entry.attempts ?? 0) + 1;
-          entry.last_status = typeof record?.status === "string" ? record.status : "error";
-          await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
-        });
+        const state = await recoverNotificationOutbox(descartesPaths);
+        const entry = state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
+        if (!entry) return record;
+        entry.attempts = (entry.attempts ?? 0) + 1;
+        entry.last_status = typeof record?.status === "string" ? record.status : "error";
+        await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
       }
     }
     return record;

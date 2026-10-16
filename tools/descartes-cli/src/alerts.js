@@ -16,7 +16,7 @@ import {
   readNotificationDeliveryConfig,
   testNotificationDelivery,
   readPendingNotifications,
-  viewPendingNotifications,
+  appendSeenNotification,
   writeNotificationDeliveryConfig,
 } from "./notification-delivery.js";
 
@@ -355,7 +355,9 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     if (options.json) output(JSON.stringify({ digest }, null, 2));
     else output(renderAlertDigest(digest));
     // Only the notices this digest showed become seen; one queued since stays pending.
-    await viewPendingNotifications(descartesPaths, { now: runtime.now, ids: filterNotificationEntries(digest.notifications?.pending, "pending").entries.map((notice) => notice.id) });
+    for (const notice of filterNotificationEntries(digest.notifications?.pending, "pending").entries) {
+      await appendSeenNotification(descartesPaths, notice.id, { now: runtime.now });
+    }
     return;
   }
 
@@ -381,7 +383,9 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, renderOptions), notification_due_ids: result.notification_due_ids }, null, 2));
     else output(renderAlertList(result.alerts, renderOptions));
     // Only the notices this view rendered become seen; one queued since stays pending.
-    await viewPendingNotifications(descartesPaths, { now: runtime.now, ids: filterNotificationEntries(pendingNotifications, "pending").entries.map((notice) => notice.id) });
+    for (const notice of filterNotificationEntries(pendingNotifications, "pending").entries) {
+      await appendSeenNotification(descartesPaths, notice.id, { now: runtime.now });
+    }
   };
 
   if (options.subcommand === "list") {

@@ -8,7 +8,7 @@ import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricA
 import { readVerifiedAlertTransitions, reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
-import { deliverNotificationDecision } from "./notification-delivery.js";
+import { deliverNotificationDecision, foldNotificationSeenLog } from "./notification-delivery.js";
 import { deliverPendingDiscontinuityNotice, deliverPendingJournalNotices, finishPendingJournalTick, notificationOutcome, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID, writeAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
@@ -1188,6 +1188,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  let notificationSeen;
+  try {
+    notificationSeen = await foldNotificationSeenLog(descartesPaths, {
+      now: ts,
+      beforeRotate: options.beforeNotificationSeenRotate,
+    });
+  } catch (error) {
+    notificationSeen = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    console.warn(`[daemon] notification seen-log fold failed (${notificationSeen.error}); it remains for the next tick`);
+  }
   try {
     await fs.unlink(path.join(descartesPaths.stateDir, "daemon", LEGACY_CONTENT_PIN_FILE));
   } catch (error) {
@@ -2637,7 +2647,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       pendingJournal = { status: "error", error: error instanceof Error ? error.message : String(error) };
     }
   }
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion, alertDigest };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion, alertDigest, notificationSeen };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
