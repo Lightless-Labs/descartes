@@ -45,6 +45,7 @@ export function isNotificationEntry(entry) {
   if (!Number.isSafeInteger(entry.attempts) || entry.attempts < 0) return false;
   if (!(entry.last_status === null || typeof entry.last_status === "string")) return false;
   if (entry.notices_overflowed !== undefined && (!Number.isSafeInteger(entry.notices_overflowed) || entry.notices_overflowed < 0)) return false;
+  if (entry.summary_version !== undefined && (!Number.isSafeInteger(entry.summary_version) || entry.summary_version < 1)) return false;
   if (entry.corruption !== undefined && typeof entry.corruption !== "string") return false;
   if (entry.delivered_at !== undefined && !isIsoString(entry.delivered_at)) return false;
   if (entry.last_attempt_at !== undefined && !isIsoString(entry.last_attempt_at)) return false;
@@ -199,18 +200,37 @@ function outboxIntegrityEntry(kind, message, now) {
     body: decision.body,
     attempts: 0,
     last_status: null,
-    ...(kind === "overflow" ? { notices_overflowed: 0 } : { corruption: message }),
+    ...(kind === "overflow" ? { notices_overflowed: 0, summary_version: 1 } : { corruption: message }),
   };
+}
+
+function overflowSummaryDigest(summary) {
+  return crypto.createHash("sha256").update(canonicalJson({
+    id: summary.id,
+    rule_id: summary.rule_id,
+    summary_version: summary.summary_version,
+    notices_overflowed: summary.notices_overflowed,
+    severity: summary.severity,
+    title: summary.title,
+    body: summary.body,
+  })).digest("hex");
 }
 
 function updateOverflowSummary(existing, count, now) {
   const summary = existing ?? outboxIntegrityEntry("overflow", "", now);
   const noticesOverflowed = (summary.notices_overflowed ?? 0) + count;
-  return {
+  const updated = {
     ...summary,
     notices_overflowed: noticesOverflowed,
+    summary_version: (summary.summary_version ?? 0) + 1,
     body: `Required notification outbox overflowed; ${noticesOverflowed} unresolved notice${noticesOverflowed === 1 ? "" : "s"} are represented by this counted summary.`,
+    attempts: 0,
+    last_status: null,
+    delivered_at: undefined,
+    last_attempt_at: undefined,
+    next_attempt_at: undefined,
   };
+  return { ...updated, digest: overflowSummaryDigest(updated) };
 }
 
 async function writePendingState(pendingFile, state, now) {
