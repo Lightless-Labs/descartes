@@ -148,3 +148,15 @@ test("digest survives a structurally malformed outbox and reports the integrity 
   assert.doesNotThrow(() => renderAlertDigest({ ...digest, notifications: { pending: [null, 5, { title: "x" }] } }));
   assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false);
 });
+
+test("plain-text digest visibly warns when the notification outbox cannot be read", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: iso(0) });
+  const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.mkdir(pendingFile);
+
+  const digest = await buildAlertDigest(paths, { now: iso(HOUR) });
+
+  assert.match(renderAlertDigest(digest), /WARNING: notification outbox could not be read \(EISDIR/);
+});

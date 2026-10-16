@@ -740,3 +740,30 @@ test("daemon retention keeps the newest 50 notices in the 30-day window and aggr
   assert.equal(view.older_count, 5);
   assert.ok(view.entries.some((notice) => notice.rule_id === "integrity.notification_outbox"));
 });
+
+test("daemon retention removes quarantined outbox archives older than 30 days and beyond the newest ten", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  const alertsDir = path.dirname(pendingFile);
+  const nowMs = Date.parse("2026-06-30T00:00:00.000Z");
+  await fs.mkdir(alertsDir, { recursive: true });
+  for (let index = 0; index < 12; index += 1) {
+    const file = path.join(alertsDir, `notification-pending.json.corrupt-${index}`);
+    await fs.writeFile(file, "corrupt");
+    const at = new Date(nowMs - index * 60 * 60 * 1000);
+    await fs.utimes(file, at, at);
+  }
+  const oldArchive = path.join(alertsDir, "notification-pending.json.corrupt-old");
+  await fs.writeFile(oldArchive, "corrupt");
+  const oldAt = new Date(nowMs - 31 * 24 * 60 * 60 * 1000);
+  await fs.utimes(oldArchive, oldAt, oldAt);
+
+  const retained = await retainNotificationOutbox(paths, { now: new Date(nowMs).toISOString() });
+
+  assert.equal(retained.removed_archives, 3);
+  const archives = (await fs.readdir(alertsDir)).filter((name) => name.startsWith("notification-pending.json.corrupt-"));
+  assert.equal(archives.length, 10);
+  assert.equal(archives.includes("notification-pending.json.corrupt-0"), true);
+  assert.equal(archives.includes("notification-pending.json.corrupt-11"), false);
+  assert.equal(archives.includes("notification-pending.json.corrupt-old"), false);
+});

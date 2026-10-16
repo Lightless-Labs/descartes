@@ -98,6 +98,18 @@ test("alerts list renders present alerts and reports a malformed outbox without 
   await assert.rejects(fs.access(path.join(paths.stateDir, "alerts", "notification-seen.jsonl")));
 });
 
+test("plain-text alerts list visibly warns when the notification outbox cannot be read", async () => {
+  const paths = await tempPaths();
+  const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.mkdir(pendingFile);
+
+  const outputs = [];
+  await runAlerts(paths, ["list"], { output: (line) => outputs.push(line), now: "2026-05-29T00:00:00.000Z" });
+
+  assert.match(outputs[0], /WARNING: notification outbox could not be read \(EISDIR/);
+});
+
 test("alert list renderer skips odd pending notices and counts them without hiding alerts", () => {
   const output = renderAlertList([{
     id: "alert_present",

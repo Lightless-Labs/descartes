@@ -105,6 +105,32 @@ test("the daemon retries a due required notice on the next tick after its channe
   assert.equal(state.notices.find((entry) => entry.id === "epoch:notice").last_status, "cli_only");
 });
 
+test("daemon status records quarantined outbox archives removed by retention", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  const alertsDir = path.dirname(pendingFile);
+  const nowMs = Date.parse("2026-10-12T00:00:00.000Z");
+  await fs.mkdir(alertsDir, { recursive: true });
+  for (let index = 0; index < 11; index += 1) {
+    const file = path.join(alertsDir, `notification-pending.json.corrupt-${index}`);
+    await fs.writeFile(file, "corrupt");
+    const at = new Date(nowMs - index * 60 * 60 * 1000);
+    await fs.utimes(file, at, at);
+  }
+  const oldArchive = path.join(alertsDir, "notification-pending.json.corrupt-old");
+  await fs.writeFile(oldArchive, "corrupt");
+  const oldAt = new Date(nowMs - 31 * 24 * 60 * 60 * 1000);
+  await fs.utimes(oldArchive, oldAt, oldAt);
+
+  const result = await runDaemonIteration(paths, {
+    collectors: collectorsWithMemory(0.1),
+    ts: new Date(nowMs).toISOString(),
+    now: new Date(nowMs).toISOString(),
+  });
+
+  assert.equal(result.notificationOutbox.removed_archives, 2);
+});
+
 test("closure integrity audit is recorded before a delivery exception", async () => {
   const paths = await tempPaths();
   let captured;
