@@ -16,7 +16,7 @@ import { resolveAlertLabelPaths } from "./alert-labels.js";
 import { atomicWrite } from "./hash-chain.js";
 import { readFactIntegrityLedger } from "./fact-store-integrity.js";
 import { inspectPendingJournal, PENDING_JOURNAL_FAMILIES, pendingAdmissionStatus } from "./pending-journal.js";
-import { deliverNotificationDecision, queuePendingNotification, readPendingNotifications, resolvePendingNotification } from "./notification-delivery.js";
+import { deliverNotificationDecision, filterNotificationEntries, queuePendingNotification, readPendingNotifications, resolvePendingNotification } from "./notification-delivery.js";
 
 // §16.1 (O): the digest period. Default daily, sent only when not empty.
 export const DIGEST_PERIOD_MS = 24 * 60 * 60 * 1000;
@@ -58,6 +58,8 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
   const state = await readJsonOrNull(resolveAlertDigestPaths(descartesPaths).stateFile);
   const sinceIso = new Date(since ?? state?.last_period_end ?? (Date.parse(nowIso) - DIGEST_PERIOD_MS)).toISOString();
   const inPeriod = (ts) => ts > sinceIso && ts <= nowIso;
+  // readPendingNotifications is the one exception to read-only: a corrupt outbox is quarantined and
+  // replaced (with a pending integrity notice) so the digest reports it instead of failing.
   const [alerts, transitions, pendingNotifications] = await Promise.all([readAlertRecords(descartesPaths), readAlertTransitions(descartesPaths), readPendingNotifications(descartesPaths)]);
   const alertsById = new Map(alerts.map((alert) => [alert.id, alert]));
   const records = transitions.records.filter((record) => typeof record.ts === "string" && inPeriod(record.ts));
@@ -141,7 +143,7 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
       transition_log: { status: transitions.status, gaps: byKind("chain_restart", "rebaselined").map((record) => ({ ts: record.ts, kind: record.kind, reason: record.reason ?? null })) },
       journals: Object.entries(journals).filter(([, journal]) => journal.status !== "valid").map(([family, journal]) => ({ family, status: journal.status, cause: journal.cause ?? null })),
     },
-    notifications: { pending: pendingNotifications.pending ?? [] },
+    notifications: { pending: filterNotificationEntries(pendingNotifications.pending, "pending").entries },
   };
   digest.counts = {
     admissions: digest.admissions.length,
@@ -197,7 +199,7 @@ export function renderAlertDigest(digest) {
   for (const entry of digest.admission_suspended) lines.push(`- ${entry.family}: unattended admission suspended (${entry.reason})`);
   for (const gap of digest.integrity.transition_log.gaps) lines.push(`- transition log ${gap.kind}${gap.reason ? ` (${gap.reason})` : ""} at ${gap.ts}`);
   for (const notice of digest.integrity.active_notices) lines.push(`- integrity notice active: ${notice.rule_id}`);
-  for (const notice of digest.notifications?.pending ?? []) lines.push(`- required notification pending: ${notice.title} [${notice.digest?.slice(0, 16) ?? "no-digest"}]`);
+  for (const notice of filterNotificationEntries(digest.notifications?.pending, "pending").entries) lines.push(`- required notification pending: ${notice.title} [${notice.digest.slice(0, 16)}]`);
   return lines.join("\n");
 }
 

@@ -79,6 +79,40 @@ test("alerts list evaluates local history and prints active alerts", async () =>
   assert.match(outputs[0], /disk/i);
 });
 
+test("alerts list quarantines a malformed pending notice and still renders present alerts", async () => {
+  const paths = await tempPaths();
+  const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null], seen: [], resolved: [] }));
+
+  const outputs = [];
+  await runAlerts(paths, ["list"], { output: (line) => outputs.push(line), now: "2026-05-29T00:00:00.000Z" });
+
+  // The evaluated (present) alerts render in full; the corrupt outbox only adds its integrity notice.
+  assert.match(outputs[0], /^Alerts \(\d+ active\)/);
+  assert.match(outputs[0], /\[warning\/active\] No recent metric samples/);
+  assert.match(outputs[0], /Required notices pending: 1/);
+  assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")));
+  const state = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+  assert.equal(state.pending.length, 0, "the list view records the queued integrity notice as seen after rendering");
+  assert.equal(state.seen[0].rule_id, "integrity.notification_outbox");
+});
+
+test("alert list renderer skips odd pending notices and counts them without hiding alerts", () => {
+  const output = renderAlertList([{
+    id: "alert_present",
+    status: "active",
+    severity: "warning",
+    title: "Present alert",
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T00:00:00.000Z",
+  }], { pendingNotifications: [null, { id: "notice", title: "Notice", digest: "a".repeat(64), rule_id: "integrity.test", first_seen_at: "2026-05-28T00:00:00.000Z", severity: "warning", body: "Body", attempts: 0, last_status: null }, { title: 7 }] });
+  assert.match(output, /alert_present/);
+  assert.match(output, /Required notices pending: 1/);
+  assert.match(output, /pending notice: Notice/);
+  assert.match(output, /Required notices skipped: 2/);
+});
+
 test("alerts list is read-only: never recovers an active alert from a detector family it did not evaluate", async () => {
   const paths = await tempPaths();
   const [seeded] = await writeAlertRecords(paths, [{

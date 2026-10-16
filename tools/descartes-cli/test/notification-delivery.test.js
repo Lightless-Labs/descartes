@@ -161,6 +161,92 @@ test("corrupt notification outbox is surfaced as a durable integrity notice", as
   assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")));
 });
 
+function validEntry(overrides = {}) {
+  return {
+    id: "notice:valid",
+    digest: "a".repeat(64),
+    rule_id: "integrity.test",
+    first_seen_at: "2026-05-29T00:00:00.000Z",
+    severity: "warning",
+    title: "Valid",
+    body: "Body",
+    attempts: 0,
+    last_status: null,
+    ...overrides,
+  };
+}
+
+test("malformed notification entries in any outbox section are quarantined and replaced", async () => {
+  const seenEntry = validEntry({ seen_at: "2026-05-29T00:01:00.000Z", resolution: "viewed" });
+  const resolvedEntry = validEntry({ resolved_at: "2026-05-29T00:01:00.000Z", resolution: "delivered" });
+  const cases = [
+    { pending: [null], seen: [], resolved: [] },
+    { pending: [validEntry(), 7], seen: [], resolved: [] },
+    { pending: [validEntry({ title: undefined })], seen: [], resolved: [] },
+    { pending: [validEntry({ attempts: -1 })], seen: [], resolved: [] },
+    { pending: [], seen: [null], resolved: [] },
+    { pending: [], seen: [validEntry()], resolved: [] },
+    { pending: [], seen: [seenEntry], resolved: [{ ...resolvedEntry, resolution: undefined }] },
+    { pending: [], seen: [], resolved: [validEntry()] },
+  ];
+  for (const [index, body] of cases.entries()) {
+    const paths = await tempPaths();
+    const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+    await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+    await fs.writeFile(pendingFile, JSON.stringify({ v: 1, ...body }));
+
+    const state = await readPendingNotifications(paths);
+    assert.equal(state.tamper?.kind, "notification_outbox_corrupt", `case ${index}`);
+    assert.equal(state.pending.length, 1, `case ${index}`);
+    assert.equal(state.pending[0].rule_id, "integrity.notification_outbox", `case ${index}`);
+    const persisted = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+    assert.equal(persisted.pending.length, 1, `case ${index}: a fresh valid outbox replaces the corrupt one`);
+    assert.equal((await readPendingNotifications(paths)).tamper, undefined, `case ${index}: the fresh outbox reads clean`);
+    assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), `case ${index}`);
+  }
+});
+
+test("a required notice still queues after a structurally malformed outbox", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null], seen: [], resolved: [] }));
+  const record = await deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
+    now: "2026-05-29T00:05:00.000Z",
+    required: true,
+    requiredNoticeId: "notice:after-malformed",
+    ruleId: "integrity.test",
+  });
+  assert.equal(record.status, "disabled");
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.tamper, undefined);
+  assert.deepEqual(state.pending.map((entry) => entry.id).sort(), ["integrity.notification_outbox:corrupt", "notice:after-malformed"]);
+  assert.equal(state.pending.find((entry) => entry.id === "notice:after-malformed").attempts, 1);
+});
+
+test("every outbox entry the module writes passes its own shape validation", async () => {
+  const paths = await tempPaths();
+  const options = (id, extra = {}) => ({ now: "2026-05-29T00:06:00.000Z", required: true, requiredNoticeId: id, ruleId: "integrity.test", ...extra });
+  // failed attempt mutates attempts/last_status
+  await deliverNotificationDecision(paths, { notify: true, title: "Failing", body: "Body" }, options("notice:failing", {
+    config: { enabled: true, channel: "macos-native" }, platform: "darwin", nativeHelperBaseDir: paths.cacheDir,
+  }));
+  // delivered settles into resolved
+  await deliverNotificationDecision(paths, { notify: true, title: "Delivered", body: "Body" }, options("notice:delivered", {
+    config: { enabled: true, channel: "syslog" }, platform: "linux", runner: async () => ({ stdout: "", stderr: "" }),
+  }));
+  // a numeric rule id and a Date `now` are normalized, never self-corrupting
+  await queuePendingNotification(paths, { notify: true, title: "Odd inputs", body: "Body" }, { now: new Date("2026-05-29T00:07:00.000Z"), requiredNoticeId: "notice:odd", ruleId: 42 });
+  await viewPendingNotifications(paths, { now: "2026-05-29T00:08:00.000Z" });
+  await queuePendingNotification(paths, { notify: true, title: "Still pending", body: "Body" }, options("notice:pending"));
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.tamper, undefined);
+  assert.ok(state.resolved.some((entry) => entry.id === "notice:delivered"));
+  assert.ok(state.seen.some((entry) => entry.id === "notice:failing" && entry.attempts === 1));
+  assert.ok(state.seen.some((entry) => entry.id === "notice:odd" && entry.rule_id === "42"));
+  assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:pending"]);
+});
+
 test("repeated identical delivery failures append one immutable audit row per attempt", async () => {
   const paths = await tempPaths();
   const options = {

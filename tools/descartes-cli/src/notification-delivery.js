@@ -25,22 +25,99 @@ export function resolveNotificationDeliveryPaths(descartesPaths) {
   };
 }
 
-export async function readPendingNotifications(descartesPaths) {
-  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+function isIsoString(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+/** Stored notices are an outbox record, not an arbitrary notification payload. */
+export function isNotificationEntry(entry, section = "pending") {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  if (typeof entry.id !== "string" || entry.id.length === 0) return false;
+  if (typeof entry.digest !== "string" || entry.digest.length === 0) return false;
+  if (!(typeof entry.rule_id === "string" || entry.rule_id === null)) return false;
+  if (!isIsoString(entry.first_seen_at)) return false;
+  if (!(entry.severity === "info" || entry.severity === "warning" || entry.severity === "critical")) return false;
+  if (typeof entry.title !== "string" || typeof entry.body !== "string") return false;
+  if (!Number.isSafeInteger(entry.attempts) || entry.attempts < 0) return false;
+  if (!(entry.last_status === null || typeof entry.last_status === "string")) return false;
+  if (entry.notices_overflowed !== undefined && (!Number.isSafeInteger(entry.notices_overflowed) || entry.notices_overflowed < 0)) return false;
+  if (entry.corruption !== undefined && typeof entry.corruption !== "string") return false;
+  if (section === "seen" && !isIsoString(entry.seen_at)) return false;
+  if (section === "resolved" && (!isIsoString(entry.resolved_at) || typeof entry.resolution !== "string" || entry.resolution.length === 0)) return false;
+  return true;
+}
+
+export function filterNotificationEntries(entries, section = "pending") {
+  const valid = [];
+  let skipped = 0;
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (isNotificationEntry(entry, section)) valid.push(entry);
+    else skipped += 1;
+  }
+  return { entries: valid, skipped };
+}
+
+async function recoverCorruptNotificationOutbox(pendingFile, message, now, corruptText) {
+  const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
   try {
-    const parsed = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+    // Narrow the read/rename window: if another writer replaced the outbox since it was read, the
+    // replacement is not ours to quarantine; report it as corrupt-at-read only when it is unchanged.
+    if (corruptText !== undefined && await fs.readFile(pendingFile, "utf8") !== corruptText) {
+      const error = new Error("notification outbox changed during recovery");
+      error.code = "EOUTBOXCHANGED";
+      throw error;
+    }
+    await fs.rename(pendingFile, quarantine);
+  } catch (error) {
+    if (error?.code === "EOUTBOXCHANGED") throw error;
+    if (error?.code !== "ENOENT") {
+      // Keep the durable integrity signal even when the original file cannot be moved.
+      message = `${message}; quarantine failed: ${error?.message ?? String(error)}`;
+    }
+  }
+  const fresh = { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [] };
+  await atomicWrite(pendingFile, JSON.stringify({ ...fresh, updated_at: now }));
+  return fresh;
+}
+
+/**
+ * Reads the required-notice outbox. Every entry in pending/seen/resolved must have the full outbox
+ * record shape; a parseable-but-malformed outbox is as corrupt as invalid JSON. A corrupt outbox is
+ * quarantined here (renamed aside) and replaced by a fresh valid outbox holding a pending integrity
+ * notice, so callers only ever see well-formed entries. This is the one write a read may make.
+ */
+export async function readPendingNotifications(descartesPaths, { recoveryAttempts = 2 } = {}) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const now = new Date().toISOString();
+  let text;
+  try {
+    text = await fs.readFile(pendingFile, "utf8");
+    const parsed = JSON.parse(text);
     if (parsed?.v !== 1 || !Array.isArray(parsed.pending) || !Array.isArray(parsed.seen) || !Array.isArray(parsed.resolved)) {
       throw new Error("notification outbox has an invalid schema");
     }
+    for (const [section, entries] of [["pending", parsed.pending], ["seen", parsed.seen], ["resolved", parsed.resolved]]) {
+      const invalidIndex = entries.findIndex((entry) => !isNotificationEntry(entry, section));
+      if (invalidIndex >= 0) throw new Error(`notification outbox has an invalid ${section} entry at index ${invalidIndex}`);
+    }
     return {
       v: 1,
-      pending: Array.isArray(parsed?.pending) ? parsed.pending : [],
-      seen: Array.isArray(parsed?.seen) ? parsed.seen : [],
-      resolved: Array.isArray(parsed?.resolved) ? parsed.resolved : [],
+      pending: parsed.pending,
+      seen: parsed.seen,
+      resolved: parsed.resolved,
     };
   } catch (error) {
     if (error?.code === "ENOENT") return { v: 1, pending: [], seen: [], resolved: [] };
-    return { v: 1, pending: [], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message: error?.message ?? String(error) } };
+    const message = error?.message ?? String(error);
+    try {
+      const fresh = await recoverCorruptNotificationOutbox(pendingFile, message, now, text);
+      return { ...fresh, tamper: { kind: "notification_outbox_corrupt", message }, recovered: true };
+    } catch (recoveryError) {
+      if (recoveryError?.code === "EOUTBOXCHANGED" && recoveryAttempts > 1) return readPendingNotifications(descartesPaths, { recoveryAttempts: recoveryAttempts - 1 });
+      const failure = `${message}; recovery failed: ${recoveryError?.message ?? String(recoveryError)}`;
+      // Unrecovered: the integrity notice is surfaced in memory; writers must quarantine before writing.
+      return { v: 1, pending: [outboxIntegrityEntry("corrupt", failure, now)], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message: failure } };
+    }
   }
 }
 
@@ -85,9 +162,11 @@ export async function queuePendingNotification(descartesPaths, decision, options
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   let state = await readPendingNotifications(descartesPaths);
   const now = options.now ?? new Date().toISOString();
-  if (state.tamper) {
+  if (state.tamper && !state.recovered) {
     const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
-    await fs.rename(pendingFile, quarantine);
+    await fs.rename(pendingFile, quarantine).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
     state = { v: 1, pending: [outboxIntegrityEntry("corrupt", state.tamper.message, now)], seen: [], resolved: [] };
   }
   const payload = normalizeNotificationPayload(decision, options);
@@ -96,8 +175,8 @@ export async function queuePendingNotification(descartesPaths, decision, options
   const entry = existing ?? {
     id,
     digest: pendingNoticeDigest(decision, options),
-    rule_id: options.ruleId ?? null,
-    first_seen_at: options.now ?? new Date().toISOString(),
+    rule_id: options.ruleId === undefined || options.ruleId === null ? null : String(options.ruleId),
+    first_seen_at: normalizeIso(options.now ?? new Date().toISOString(), "now"),
     severity: payload.severity,
     title: payload.title,
     body: payload.body,
@@ -124,7 +203,7 @@ export async function queuePendingNotification(descartesPaths, decision, options
 async function settlePendingNotification(descartesPaths, id, status, now) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const state = await readPendingNotifications(descartesPaths);
-  if (state.tamper) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
+  if (state.tamper && !state.recovered) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
   const index = state.pending.findIndex((entry) => entry.id === id);
   if (index < 0) return;
   const [entry] = state.pending.splice(index, 1);
@@ -139,9 +218,11 @@ export async function resolvePendingNotification(descartesPaths, id, status, now
 export async function viewPendingNotifications(descartesPaths, { now = new Date().toISOString() } = {}) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const state = await readPendingNotifications(descartesPaths);
-  if (state.tamper) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
-  if (state.pending.length === 0) return [];
-  const viewed = state.pending.map((entry) => ({ ...entry, seen_at: now, resolution: "viewed" }));
+  // An unrecovered corrupt outbox is left in place for a writer to quarantine; never overwrite it here.
+  if (state.tamper && !state.recovered) return [];
+  const { entries: pending } = filterNotificationEntries(state.pending, "pending");
+  if (pending.length === 0) return [];
+  const viewed = pending.map((entry) => ({ ...entry, seen_at: now, resolution: "viewed" }));
   await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: [], seen: [...state.seen, ...viewed].slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
   return viewed;
 }
@@ -525,7 +606,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
       if (delivered || cliViewed) await settlePendingNotification(descartesPaths, options.requiredNoticeId, delivered ? "delivered" : "cli_only", now);
       else {
         const state = await readPendingNotifications(descartesPaths);
-        const entry = state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
+        const entry = state.tamper && !state.recovered ? undefined : state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
         if (entry) {
           entry.attempts = (entry.attempts ?? 0) + 1;
           entry.last_status = record?.status ?? "error";

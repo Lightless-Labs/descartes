@@ -133,3 +133,16 @@ test("alerts digest CLI is read-only", async () => {
   assert.equal(JSON.parse(out[0]).digest.open_event_alerts.length, 1);
   await assert.rejects(fs.access(resolveAlertDigestPaths(paths).stateFile));
 });
+
+test("digest survives a structurally malformed outbox and reports the integrity notice", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: iso(0) });
+  const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null, { title: 3 }], seen: [], resolved: [] }));
+  const digest = await buildAlertDigest(paths, { now: iso(HOUR) });
+  assert.deepEqual(digest.notifications.pending.map((notice) => notice.rule_id), ["integrity.notification_outbox"]);
+  assert.match(renderAlertDigest(digest), /required notification pending: Descartes: required notification outbox corrupt/);
+  // A persisted digest re-rendered with odd notices still renders.
+  assert.doesNotThrow(() => renderAlertDigest({ ...digest, notifications: { pending: [null, 5, { title: "x" }] } }));
+});

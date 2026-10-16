@@ -10,6 +10,7 @@ import { buildAlertDigest, renderAlertDigest } from "./alert-digest.js";
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
+  filterNotificationEntries,
   notificationDeliveryResolution,
   notificationPlatformNotes,
   readNotificationDeliveryConfig,
@@ -146,10 +147,21 @@ export function visibleAlerts(alerts, options = {}) {
   return sortAlerts(alerts.filter((alert) => options.all || activeStatuses.has(alert.status)));
 }
 
+function renderPendingNotices(lines, pendingNotifications) {
+  // Odd notices never hide present alerts: only well-formed outbox entries render; the rest are counted.
+  const { entries, skipped } = filterNotificationEntries(pendingNotifications, "pending");
+  if (entries.length > 0) {
+    lines.push(`Required notices pending: ${entries.length}`);
+    for (const notice of entries) lines.push(`- pending notice: ${notice.title} [${notice.digest.slice(0, 16)}]`);
+  }
+  if (skipped > 0) lines.push(`Required notices skipped: ${skipped} (malformed outbox entr${skipped === 1 ? "y" : "ies"})`);
+}
+
 export function renderAlertList(alerts, options = {}) {
   const shown = visibleAlerts(alerts, options);
-  if (shown.length === 0) return options.all ? "No alert records." : "No active alerts.";
-  const lines = [`Alerts (${shown.length}${options.all ? " total" : " active"})`];
+  const lines = shown.length === 0
+    ? [options.all ? "No alert records." : "No active alerts."]
+    : [`Alerts (${shown.length}${options.all ? " total" : " active"})`];
   for (const alert of shown) {
     lines.push(`- ${alert.id} [${alert.severity}/${alert.status}] ${alert.title}`);
     if (alert.summary) lines.push(`  ${alert.summary}`);
@@ -157,15 +169,13 @@ export function renderAlertList(alerts, options = {}) {
     if (alert.acknowledged_at) lines.push(`  acknowledged_at=${alert.acknowledged_at}`);
     if (alert.delivery_failure_count > 0) lines.push(`  delivery= failing since ${alert.delivery_failing_since ?? alert.last_delivery_failure_at ?? "unknown"} (next attempt ${alert.next_attempt_at ?? "now"}; ${alert.delivery_failure_count} failure${alert.delivery_failure_count === 1 ? "" : "s"}${alert.delivery_failure_reason ? `: ${alert.delivery_failure_reason}` : ""})`);
   }
-  if ((options.pendingNotifications?.length ?? 0) > 0) {
-    lines.push(`Required notices pending: ${options.pendingNotifications.length}`);
-    for (const notice of options.pendingNotifications) lines.push(`- pending notice: ${notice.title} [${notice.digest?.slice(0, 16) ?? "no-digest"}]`);
-  }
+  renderPendingNotices(lines, options.pendingNotifications);
   return lines.join("\n");
 }
 
 function jsonAlertPayload(alerts, options = {}) {
-  return { alerts: visibleAlerts(alerts, options), pending_notifications: options.pendingNotifications ?? [] };
+  const { entries, skipped } = filterNotificationEntries(options.pendingNotifications, "pending");
+  return { alerts: visibleAlerts(alerts, options), pending_notifications: entries, ...(skipped > 0 ? { pending_notifications_skipped: skipped } : {}) };
 }
 
 // S13 nice-to-have: surface enabled_namespaces + critical_reservation + a corrupt-config marker,
