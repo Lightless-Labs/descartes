@@ -10,7 +10,7 @@ import { runDaemonIteration } from "../src/daemon.js";
 import { readAlertRecords } from "../src/alert-store.js";
 import { readAlertTransitions } from "../src/alert-transitions.js";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { deliverNotificationDecision, readPendingNotifications, resolveNotificationDeliveryPaths, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
+import { deliverNotificationDecision, queuePendingNotification, readPendingNotifications, resolveNotificationDeliveryPaths, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-c1-daemon-test-"));
@@ -103,6 +103,54 @@ test("the daemon retries a due required notice on the next tick after its channe
   assert.equal(result.notificationOutbox.drained, 1);
   assert.equal(state.pending.length, 0);
   assert.equal(state.notices.find((entry) => entry.id === "epoch:notice").last_status, "cli_only");
+});
+
+test("due notice draining runs after collection and opens one route circuit for a slow failing channel", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-10-12T00:00:00.000Z";
+  for (let index = 0; index < 50; index += 1) {
+    await queuePendingNotification(paths, {
+      notify: true,
+      severity: "warning",
+      title: `Due notice ${index}`,
+      body: "The notice remains pending.",
+    }, {
+      now: ts,
+      requiredNoticeId: `notice:${index}`,
+      ruleId: "integrity.test",
+    });
+  }
+  await writeNotificationDeliveryConfig(paths, { enabled: true, channel: "cli" }, { now: ts });
+
+  const events = [];
+  const drainCalls = [];
+  const collectors = {
+    system: async () => {
+      events.push("collector:start");
+      return envelope("system-overview", "collect_system", { load_average: [0.1, 0.1, 0.1], uptime_seconds: 10, memory: { used_fraction: 0.1, free_bytes: 1 }, swap: { used_bytes: 0 } });
+    },
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+  const result = await runDaemonIteration(paths, {
+    collectors,
+    ts,
+    now: ts,
+    deliverNotification: async () => {
+      events.push("drain:attempt");
+      drainCalls.push(true);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { status: "error" };
+    },
+  });
+
+  assert.equal(events[0], "collector:start", "collection must start before any due-notice adapter attempt");
+  assert.equal(drainCalls.length, 1, "a failing route gets at most one adapter attempt per tick");
+  assert.equal(result.notificationOutbox.drained, 50);
+  assert.equal(result.notificationOutbox.failed, 50);
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.pending.length, 50, "circuit-skipped notices remain pending");
+  assert.ok(state.pending.every((entry) => entry.next_attempt_at), "failed and skipped notices receive backoff");
 });
 
 test("daemon status records quarantined outbox archives removed by retention", async () => {
