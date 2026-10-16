@@ -2,7 +2,24 @@
 
 **Last updated:** 2026-10-16
 
-## C1 daybreak gate 3–6 follow-ups — 2026-10-16 — local, not pushed
+## C1 notification outbox single-writer replacement — 2026-10-16 — local, not pushed
+
+Removed the recurring notification-outbox lock blocker from `feat/c1-alert-foundations-2026-10`
+with two atomic commits: `d3bfb28` (TDD regressions and removal of lock-specific tests) and
+`8063af0` (implementation). The daemon is now the only outbox writer. CLI list/digest rendering
+reads the outbox without mutation; seen notices append validated, bounded JSONL records to
+`notification-seen.jsonl` with `O_APPEND`, and the daemon folds them by notice id, checkpoints the
+consumed offset, and rotates the consumed generation. Corrupt outboxes remain untouched by CLI and
+are quarantined/recovered only by the daemon. Malformed seen lines are ignored and counted.
+
+Focused verification: notification delivery **36/36**, alerts + digest + pending journal **60/60**,
+daemon **192/192**. Full fresh-XDG `npm test`: **2,812 tests: 2,749 pass, 22 fail, 35 skipped,
+6 todo** in 471.5 seconds. The 22 failures are environment-only: 17 notifier-reuse and 3
+tap-bump loopback test-server cases fail with sandbox `listen EPERM`, and 2 live macOS provenance
+checks return `unknown` under restricted process introspection. No changed-area product test failed.
+No push or merge.
+
+## C1 daybreak gate 3–6 follow-ups — 2026-10-16 — historical lock notes, superseded locally
 
 Gate 3 (1 BLOCKER, 1 MEDIUM) and gate 4 (1 BLOCKER, 1 MEDIUM) closed on
 `feat/c1-alert-foundations-2026-10`: `0e61a19` (malformed outbox entries ⇒ corrupt ⇒ quarantine +
@@ -18,6 +35,10 @@ into the tick summary) — those two fixes are NOT yet re-gated). Lock contract 
 scoping: addendum in `docs/plans/2026-10-12-c1-alert-evidence-boundary.md`. Fresh-XDG full
 `npm test`: **2,820 tests: 2,779 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 7 confirmation of `1af5828` + `07005d4` (gate-round budget for this cycle was exhausted at round 6)
 confirmation, then merge to local main, then C1a. No push.
+
+The cooperative lock contract described in this historical section was removed by the
+single-writer replacement above; the non-lock fixes listed here remain part of the current
+implementation.
 
 ## C1 alert evidence-boundary rework — 2026-10-12 — local, not pushed
 

@@ -1,7 +1,7 @@
 # C1 alert evidence-boundary rework
 
 **Status:** complete
-**Last updated:** 2026-10-16 — gate 3–4 follow-ups (addendum below)
+**Last updated:** 2026-10-16 — superseding single-writer outbox addendum
 
 ## Scope
 
@@ -42,7 +42,8 @@ valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are cl
   predecessor head (`through_seq`/`through_hash`) must be cited by the first kept record, and the
   header (carried witness, coverage, projection digest) is returned. The whole-file content digest in
   the state file still binds the unverified prefix, header included.
-- `0936f47`, `5b09bf9`, and the round-5 lock rewrite — **outbox lock contract:** one lock file
+- `0936f47`, `5b09bf9`, and the round-5 lock rewrite — **historical outbox lock contract (superseded
+  and removed by the single-writer addendum below):** one lock file
   `<pendingFile>.lock`, JSON `{pid, token, at}`, created complete (temp file + `link()`, which fails
   if a lock exists — never empty); every outbox read-modify-write (queue, settle, view, attempt
   bookkeeping, corruption recovery) runs under it; recovery re-reads under the lock before
@@ -60,6 +61,25 @@ valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are cl
 
 The lock is **cooperative**: a same-UID writer that ignores it can still race or rewrite the outbox.
 That is the same deliberate same-UID forgery already out of scope above, not a new boundary.
+
+## Addendum: single-writer notification outbox (2026-10-16)
+
+The cooperative outbox lock is superseded and removed. The daemon is now the only process that
+writes `notification-pending.json`: queueing, delivery attempts/results, resolution, corruption
+recovery, and compaction all happen on the daemon tick. CLI list/digest rendering reads the outbox
+without mutation. A corrupt or malformed outbox is reported in memory by the CLI and left in place;
+the daemon quarantines and replaces it.
+
+CLI seen marks use `notification-seen.jsonl`. Each mark is a validated, bounded JSON line appended
+with one `O_APPEND` write, so concurrent CLI processes never share an outbox read-modify-write.
+The daemon folds marks by notice id, persists the outbox, records consumed offsets, and rotates the
+consumed generation. Replay after a crash between the fold and rotation is harmless because notice
+ids are idempotent; rotated generations are retained for safe late-writer recovery. Malformed seen
+lines are ignored and counted without blocking valid marks.
+
+The lock, stale-break, pid-reuse probe, bounded lock wait, and their tests are removed. The
+malformed-entry validation, compaction verification, `seen.resolution` validation, ISO overflow
+timestamp normalization, and discontinuity-notice warning remain covered.
 
 ## Atomic slices
 
