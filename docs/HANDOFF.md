@@ -2,6 +2,26 @@
 
 **Last updated:** 2026-10-16
 
+## C1 due-notice drain and outbox retention follow-ups — 2026-10-16 — local, not pushed
+
+Closed the daybreak B1/B2, MEDIUM 1/2, and LOW findings in atomic commits:
+`fc9d402` (red regressions), `582efab` (daemon-owned due-notice drain), `599cf5d`
+(overflow-summary version/digest and delivery-state reset), `b45ad94` (archive and warning
+regressions), `ea9107f` (bounded quarantine archives, daemon removal count, and plain-text warnings),
+and `75490a3` (plan whitespace). The drain runs during every daemon maintenance pass, retries every
+due retained notice through the normal delivery path, and records outcomes for injected delivery
+seams as well; integrity corruption and overflow summaries are covered. Overflow aggregation now
+increments `summary_version`, changes the digest, clears delivery/backoff fields, and makes the
+summary due again. Quarantined outbox archives retain only the newest ten within 30 days, with
+removed counts in `notification_outbox` status. List and digest text expose unreadable-outbox
+warnings, including an otherwise empty digest.
+
+Affected-area verification passes **77/77**. Fresh-XDG full `npm test` reports **2,820 tests: 2,757
+pass, 22 fail, 35 skipped, 6 todo**. The 22 failures are environment-only: 17 notifier-reuse and
+3 tap-bump loopback test-server cases fail with sandbox `listen EPERM`, and 2 live-process
+provenance checks return `unknown` under restricted process introspection. No changed-area product
+test failed. No push or merge.
+
 ## C1 retained required-notice semantics — 2026-10-16 — local, not pushed
 
 Replaced the viewing/seen mechanism with a daemon-owned retained notice collection. Required
