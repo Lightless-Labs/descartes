@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { atomicWrite, canonicalJson } from "./hash-chain.js";
+import { throwIfCollectorAborted } from "./tools/collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -123,10 +124,11 @@ function parseElapsedMs(etime) {
 }
 
 /** True when the live process now at `pid` started after `atIso` (so it cannot be the lock's holder). */
-async function lockPidReused(pid, atIso) {
+async function lockPidReused(pid, atIso, { signal } = {}) {
   const at = Date.parse(atIso);
   if (!Number.isFinite(at)) return false;
   try {
+    throwIfCollectorAborted(signal);
     const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
     const elapsedMs = parseElapsedMs(stdout);
     if (elapsedMs === null) return false;
