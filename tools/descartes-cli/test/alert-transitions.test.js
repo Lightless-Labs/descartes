@@ -18,9 +18,11 @@ import {
   projectAlerts,
   reconcileAlertClosures,
   readAlertTransitions,
+  readVerifiedAlertTransitions,
   recordAlertTransitions,
   resolveAlertTransitionPaths,
 } from "../src/alert-transitions.js";
+import { sealRecord, verifyChainIncremental } from "../src/hash-chain.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 
 async function tempPaths() {
@@ -291,6 +293,56 @@ test("compaction keeps a verifiable cut header and the chain continues", async (
   assert.ok(log.coverage_from_ts >= log.header.through_ts);
   await tick(paths, [candidate()], 50);
   assert.equal((await readAlertTransitions(paths)).status, "valid");
+});
+
+test("post-compaction transition ticks verify incrementally from the persisted head", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: t(0) });
+  for (let index = 0; index < 30; index += 1) {
+    await recordAlertTransitions(paths, {
+      now: t(index + 1),
+      alerts: [],
+      extraRecords: [{ kind: "test_audit", index, pad: "x".repeat(160) }],
+      maxBytes: 1_500,
+    });
+  }
+  const compacted = await readAlertTransitions(paths);
+  assert.equal(compacted.header?.kind, "compacted");
+  const full = await readAlertTransitions(paths);
+  // Right after compaction the verified head may be the cut point or a kept record: both verify incrementally.
+  const afterCut = await readVerifiedAlertTransitions(paths, { timeBudgetMs: 100 });
+  assert.equal(afterCut.status, "valid");
+  assert.equal(afterCut.verification, "incremental");
+  assert.deepEqual(afterCut.header, full.header, "the cut header (carried witness, coverage) survives the incremental path");
+  assert.equal(afterCut.coverage_from_ts, full.coverage_from_ts);
+  assert.deepEqual(afterCut.records, full.records);
+  for (let index = 40; index < 43; index += 1) {
+    await recordAlertTransitions(paths, { now: t(index), alerts: [], extraRecords: [{ kind: "test_audit", index }], maxBytes: 1_500 });
+    const verified = await readVerifiedAlertTransitions(paths, { timeBudgetMs: 100 });
+    assert.equal(verified.status, "valid");
+    assert.equal(verified.verification, "incremental", `tick ${index} stays incremental after compaction`);
+    assert.equal(verified.header?.kind, "compacted");
+  }
+});
+
+test("incremental verification from the cut point itself and rejection of a mismatched cut header", () => {
+  const domain = "test.domain";
+  let prevHash = "h4";
+  const records = [{ kind: "compacted", through_seq: 4, through_hash: "h4" }];
+  for (let seq = 5; seq <= 7; seq += 1) {
+    const record = sealRecord(domain, { prevHash, seq }, { kind: "x" });
+    records.push(record);
+    prevHash = record.hash;
+  }
+  const fromCut = verifyChainIncremental(domain, records, { verifiedHead: { seq: 4, hash: "h4" } });
+  assert.equal(fromCut.ok, true);
+  assert.equal(fromCut.verification, "incremental");
+  assert.equal(fromCut.verified.length, 3);
+  assert.equal(fromCut.header, records[0]);
+  const bent = [{ ...records[0], through_hash: "other" }, ...records.slice(1)];
+  const rejected = verifyChainIncremental(domain, bent, { verifiedHead: { seq: 6, hash: records[2].hash } });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.verification, "full_recovery");
 });
 
 test("deriveAlertTransitions is pure and ignores carried tombstones on a closed re-arm", () => {

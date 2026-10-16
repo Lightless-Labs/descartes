@@ -137,28 +137,54 @@ export function verifyChain(domain, records, { cutKind = "compacted" } = {}) {
 }
 
 /** Verify only the suffix after a previously verified hash-chain head. The prefix remains in the
- * returned verified list so witness folding and projection recovery retain their normal semantics. */
+ * returned verified list so witness folding and projection recovery retain their normal semantics.
+ * A compacted chain keeps verifying incrementally: its cut header records the predecessor head
+ * (through_seq/through_hash), which must be well-formed and cited by the first kept record; the
+ * verified head may be that cut point itself or any kept record. The caller binds the unverified
+ * prefix (header included) to what it last verified, e.g. by a whole-file content digest. */
 export function verifyChainIncremental(domain, records, { verifiedHead = null, cutKind = "compacted", timeBudgetMs = 25 } = {}) {
   if (!verifiedHead || !Number.isSafeInteger(verifiedHead.seq) || verifiedHead.seq <= 0) return { ...verifyChain(domain, records, { cutKind }), verification: "full" };
-  const start = records.findIndex((record) => record.seq === verifiedHead.seq && record.hash === verifiedHead.hash);
-  if (start < 0 || records[0]?.kind === cutKind) return { ...verifyChain(domain, records, { cutKind }), verification: "full_recovery" };
-  let prevHash = verifiedHead.hash;
-  let prevSeq = verifiedHead.seq;
-  const verified = records.slice(0, start + 1);
+  const fullRecovery = () => ({ ...verifyChain(domain, records, { cutKind }), verification: "full_recovery" });
+  let header = null;
+  let first = 0;
+  if (records[0]?.kind === cutKind && records[0].hash === undefined) {
+    header = records[0];
+    const next = records[1];
+    if (typeof header.through_hash !== "string" || !Number.isSafeInteger(header.through_seq)) return fullRecovery();
+    if (next !== undefined && (next.seq !== header.through_seq + 1 || next.prev_hash !== header.through_hash)) return fullRecovery();
+    first = 1;
+  } else if (records[0]?.kind === cutKind) {
+    return fullRecovery();
+  }
+  let start;
+  let prevHash;
+  let prevSeq;
+  if (header && verifiedHead.seq === header.through_seq && verifiedHead.hash === header.through_hash) {
+    start = first - 1;
+    prevHash = header.through_hash;
+    prevSeq = header.through_seq;
+  } else {
+    const found = records.findIndex((record, index) => index >= first && record.seq === verifiedHead.seq && record.hash === verifiedHead.hash);
+    if (found < 0) return fullRecovery();
+    start = found;
+    prevHash = verifiedHead.hash;
+    prevSeq = verifiedHead.seq;
+  }
+  const verified = records.slice(first, start + 1);
   const started = Date.now();
   for (let index = start + 1; index < records.length; index += 1) {
     const record = records[index];
     const { hash, ...rest } = record;
     const expectedSeq = prevSeq + 1;
-    if (Date.now() - started > timeBudgetMs) return { ok: false, verified, break_at: index, reason: "verification_time_budget", head_seq: prevSeq, head_hash: prevHash, header: null, verification: "incremental" };
+    if (Date.now() - started > timeBudgetMs) return { ok: false, verified, break_at: index, reason: "verification_time_budget", head_seq: prevSeq, head_hash: prevHash, header, verification: "incremental" };
     if (record.seq !== expectedSeq || record.prev_hash !== prevHash || typeof hash !== "string" || recordHash(domain, rest) !== hash) {
-      return { ok: false, verified, break_at: index, reason: record.seq !== expectedSeq ? "seq_gap" : (record.prev_hash !== prevHash ? "prev_hash_mismatch" : "hash_mismatch"), head_seq: prevSeq, head_hash: prevHash, header: null, verification: "incremental" };
+      return { ok: false, verified, break_at: index, reason: record.seq !== expectedSeq ? "seq_gap" : (record.prev_hash !== prevHash ? "prev_hash_mismatch" : "hash_mismatch"), head_seq: prevSeq, head_hash: prevHash, header, verification: "incremental" };
     }
     verified.push(record);
     prevHash = hash;
     prevSeq = record.seq;
   }
-  return { ok: true, verified, break_at: null, reason: null, head_seq: prevSeq, head_hash: prevHash, header: null, verification: "incremental" };
+  return { ok: true, verified, break_at: null, reason: null, head_seq: prevSeq, head_hash: prevHash, header, verification: "incremental" };
 }
 
 export async function ensureDir(dir) {
