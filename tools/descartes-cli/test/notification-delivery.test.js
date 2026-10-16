@@ -761,3 +761,16 @@ test("an overflow summary created with a non-ISO now still passes outbox validat
   assert.equal(state.tamper, undefined);
   assert.ok(state.pending.some((entry) => entry.rule_id === "integrity.notification_outbox" && entry.first_seen_at === "1970-01-01T00:00:00.000Z"));
 });
+
+test("releasing the outbox lock never waits on the break lock, so a paused breaker cannot orphan it", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  const lockFile = `${pendingFile}.lock`;
+  // A live process holds the break lock (paused mid-break); the primary lock is free.
+  await fs.writeFile(`${lockFile}.break`, JSON.stringify({ pid: process.pid, token: "paused-breaker", at: new Date().toISOString() }));
+  await queuePendingNotification(paths, { notify: true, title: "Release", body: "Body" }, { now: "2026-05-29T00:20:00.000Z", requiredNoticeId: "notice:release", ruleId: "integrity.test", lockWaitMs: 200 });
+  await assert.rejects(() => fs.access(lockFile), "the primary lock is released");
+  await fs.unlink(`${lockFile}.break`);
+  assert.deepEqual((await readPendingNotifications(paths)).pending.map((entry) => entry.id), ["notice:release"]);
+});

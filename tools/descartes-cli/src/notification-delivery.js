@@ -65,10 +65,10 @@ export function filterNotificationEntries(entries, section = "pending") {
 //
 // Lock files are created complete (content written to a temp file, then link()ed into place, which
 // fails if the lock exists), so a lock is never empty. Liveness is judged from the content a waiter
-// observed, never from a re-read. Removing a lock (a holder's release, or breaking a stale one)
-// happens only under a second "break" lock and only after re-reading the exact content, so no one
-// can remove a lock other than the one they checked: a fresh lock can only be created while none
-// exists, and every removal is serialized and verified.
+// observed, never from a re-read. Breaking a stale lock happens only under a second "break" lock and
+// only after re-reading the exact observed content, so two breakers cannot remove each other's fresh
+// lock. A holder's release needs no break lock (and never waits): it removes only its own token, and
+// a breaker never removes a live holder's lock, so release and break cannot target the same lock.
 //
 // A lock held by a LIVE process is never broken, however old (an unfenced lease would let a paused
 // holder resume and overwrite a newer writer). It is stale only when its holder is dead, or when the
@@ -192,7 +192,7 @@ async function removeLockIf(lockFile, predicate) {
   }
 }
 
-// Serializes lock removal. Its own stale break is unserialized (residual: a break lock left by a
+// Serializes stale-lock breaking. Its own stale break is unserialized (residual: a break lock left by a
 // crashed process can be removed concurrently by two breakers; this needs that crash plus a three-way
 // race).
 async function withOutboxBreakLock(lockFile, fn) {
@@ -214,7 +214,7 @@ async function withOutboxLock(pendingFile, fn, { maxWaitMs } = {}) {
   try {
     return await fn();
   } finally {
-    await withOutboxBreakLock(lockFile, () => removeLockIf(lockFile, (current) => lockHolder(current)?.token === token));
+    await removeLockIf(lockFile, (current) => lockHolder(current)?.token === token);
   }
 }
 

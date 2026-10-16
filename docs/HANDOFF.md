@@ -12,7 +12,9 @@ verification survives compaction via the cut header's recorded predecessor head)
 serialized, content-verified lock removal; list/digest mark seen only rendered ids; round 5 found a
 lost-update in the first stale-break design, fixed by the lock rewrite; the re-run found the 30 s
 lease preempting a live paused holder — live holders are now never broken, pid reuse is detected via
-`ps`, and blocked waiters fail loudly after 120 s). Lock contract and its same-UID
+`ps`, and blocked waiters fail loudly after 120 s; round 6 found release waiting on the break lock
+(fixed: release never waits) and a silently unqueued discontinuity notice (fixed: warned + carried
+into the tick summary) — those two fixes are NOT yet re-gated). Lock contract and its same-UID
 scoping: addendum in `docs/plans/2026-10-12-c1-alert-evidence-boundary.md`. Fresh-XDG full
 `npm test`: **2,818 tests: 2,777 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 6
 confirmation, then merge to local main, then C1a. No push.

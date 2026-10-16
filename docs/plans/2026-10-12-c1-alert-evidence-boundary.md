@@ -50,10 +50,13 @@ valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are cl
   unfenced 30 s lease let a paused holder resume and overwrite a newer writer). It is stale only when
   the holder pid in the *observed* content is dead, or — probed with `ps -o etime=` once a lock is
   >30 s old — the live process at that pid started after the lock's `at` (pid reuse). A waiter blocked
-  by a live holder fails loudly after 120 s instead of breaking the lock. Every lock removal — a holder's release (own
-  token) or a stale break (exact observed content) — runs under a second `<lockFile>.break` lock and
-  re-reads first, so nobody removes a lock other than the one they checked. Residual: the break lock's
-  own dead-holder break is unserialized (needs a crashed break-lock holder plus a three-way race). `alerts list`/`digest` mark seen only the notice ids they rendered.
+  by a live holder fails loudly after 120 s instead of breaking the lock. A stale break (exact observed content) runs under
+  a second `<lockFile>.break` lock and re-reads first, so two breakers cannot remove each other's
+  fresh lock; a holder's release removes only its own token and never waits on the break lock (gate
+  round 6: a paused breaker could otherwise make a live releaser time out and orphan its lock). Residual: the break lock's
+  own dead-holder break is unserialized (needs a crashed break-lock holder plus a three-way race); and
+  the pid-reuse probe compares wall-clock times, so a clock stepped forward by more than the 5 s slack
+  while a lock is already >30 s old could misjudge a live holder as reused. `alerts list`/`digest` mark seen only the notice ids they rendered.
 
 The lock is **cooperative**: a same-UID writer that ignores it can still race or rewrite the outbox.
 That is the same deliberate same-UID forgery already out of scope above, not a new boundary.
