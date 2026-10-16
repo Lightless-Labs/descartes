@@ -2,6 +2,27 @@
 
 **Last updated:** 2026-10-16
 
+## C1 due-notice drain phasing and route circuit — 2026-10-16 — local, not pushed
+
+Moved retained due-notice draining to the end of the daemon tick, after collection, detection,
+alert delivery, transition work, and digest handling. The drain shares alert delivery's per-tick
+adapter route breaker: the first failure/unavailability opens the route, later retained notices
+receive normal retry backoff without another adapter attempt, and collection/detection cannot be
+delayed by the retained-notice backlog. Added a regression with 50 slow failing due notices that
+observes collection first and one adapter attempt. Fixed the stale pending-journal retry comment.
+
+TDD commits: `2a1d5f3` (red ordering/circuit regression), `9626926` (deferred drain, shared route
+breaker, stale comment), and `3b054ac` (preserve the first daemon status write failure during the
+deferred status refresh). Focused verification passes **199/199**, plus the targeted status-write
+regression **1/1**.
+
+Fresh-XDG full `npm test`: **2,821 tests: 2,758 pass, 22 fail, 0 cancelled, 35 skipped, 6 todo**.
+The 22 failures are environment-only: 17 notifier-reuse and 3 tap-bump loopback test-server
+cases fail with sandbox `listen EPERM`, and 2 live-process provenance checks return `unknown`
+under restricted process introspection. A fresh-XDG baseline before these changes had **0
+cancelled** tests, so no cancelled test was introduced by this branch change and none was available
+to repair. No push or merge.
+
 ## C1 due-notice drain and outbox retention follow-ups — 2026-10-16 — local, not pushed
 
 Closed the daybreak B1/B2, MEDIUM 1/2, and LOW findings in atomic commits:
