@@ -589,3 +589,56 @@ test("retention never deletes the segment written by the current process tick", 
   });
   await fs.access(rollbackNamed);
 });
+
+test("concurrent outbox writers never lose a required notice", async () => {
+  const paths = await tempPaths();
+  await Promise.all(Array.from({ length: 16 }, (_, index) => queuePendingNotification(paths, { notify: true, title: `Concurrent ${index}`, body: "Body" }, {
+    now: "2026-05-29T00:09:00.000Z",
+    requiredNoticeId: `notice:concurrent:${index}`,
+    ruleId: "integrity.test",
+  })));
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.tamper, undefined);
+  assert.equal(state.pending.length, 16);
+});
+
+test("corruption recovery re-checks under the outbox lock and never quarantines a valid concurrent write", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null], seen: [], resolved: [] }));
+  // Another (live) writer holds the outbox lock while it installs a valid outbox.
+  const lockFile = `${pendingFile}.lock`;
+  await fs.writeFile(lockFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  const reading = readPendingNotifications(paths);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [validEntry({ id: "notice:concurrent-valid" })], seen: [], resolved: [] }));
+  await fs.unlink(lockFile);
+  const state = await reading;
+  assert.equal(state.tamper, undefined);
+  assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:concurrent-valid"]);
+  assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false);
+});
+
+test("a stale outbox lock left by a dead process is broken", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(`${pendingFile}.lock`, JSON.stringify({ pid: 2 ** 22 + 12345, at: new Date().toISOString() }));
+  await queuePendingNotification(paths, { notify: true, title: "After stale lock", body: "Body" }, { now: "2026-05-29T00:10:00.000Z", requiredNoticeId: "notice:stale-lock", ruleId: "integrity.test" });
+  assert.deepEqual((await readPendingNotifications(paths)).pending.map((entry) => entry.id), ["notice:stale-lock"]);
+});
+
+test("seen and resolved entries must carry a well-formed resolution", async () => {
+  for (const body of [
+    { pending: [], seen: [validEntry({ seen_at: "2026-05-29T00:01:00.000Z", resolution: { odd: true } })], resolved: [] },
+    { pending: [], seen: [validEntry({ seen_at: "2026-05-29T00:01:00.000Z" })], resolved: [] },
+    { pending: [], seen: [], resolved: [validEntry({ resolved_at: "2026-05-29T00:01:00.000Z", resolution: 7 })] },
+  ]) {
+    const paths = await tempPaths();
+    const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+    await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+    await fs.writeFile(pendingFile, JSON.stringify({ v: 1, ...body }));
+    assert.equal((await readPendingNotifications(paths)).tamper?.kind, "notification_outbox_corrupt", JSON.stringify(body));
+  }
+});

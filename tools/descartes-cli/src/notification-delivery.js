@@ -42,7 +42,7 @@ export function isNotificationEntry(entry, section = "pending") {
   if (!(entry.last_status === null || typeof entry.last_status === "string")) return false;
   if (entry.notices_overflowed !== undefined && (!Number.isSafeInteger(entry.notices_overflowed) || entry.notices_overflowed < 0)) return false;
   if (entry.corruption !== undefined && typeof entry.corruption !== "string") return false;
-  if (section === "seen" && !isIsoString(entry.seen_at)) return false;
+  if (section === "seen" && (!isIsoString(entry.seen_at) || entry.resolution !== "viewed")) return false;
   if (section === "resolved" && (!isIsoString(entry.resolved_at) || typeof entry.resolution !== "string" || entry.resolution.length === 0)) return false;
   return true;
 }
@@ -57,41 +57,91 @@ export function filterNotificationEntries(entries, section = "pending") {
   return { entries: valid, skipped };
 }
 
-async function recoverCorruptNotificationOutbox(pendingFile, message, now, corruptText) {
-  const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
+// Every outbox read-modify-write (queue, settle, view, attempt bookkeeping, corruption recovery)
+// runs under one cooperative lock file, so a writer never acts on a stale read: recovery re-reads
+// under the lock before quarantining, and concurrent queues/views never lose each other's notices.
+// Cooperative only: a same-UID writer that ignores the lock is out of scope (evidence boundary).
+const OUTBOX_LOCK_WAIT_MS = 10_000;
+const OUTBOX_LOCK_UNREADABLE_STALE_MS = 2_000;
+
+async function outboxLockHolderAlive(lockFile) {
+  let holder;
   try {
-    // Narrow the read/rename window: if another writer replaced the outbox since it was read, the
-    // replacement is not ours to quarantine; report it as corrupt-at-read only when it is unchanged.
-    if (corruptText !== undefined && await fs.readFile(pendingFile, "utf8") !== corruptText) {
-      const error = new Error("notification outbox changed during recovery");
-      error.code = "EOUTBOXCHANGED";
-      throw error;
-    }
-    await fs.rename(pendingFile, quarantine);
+    holder = JSON.parse(await fs.readFile(lockFile, "utf8"));
   } catch (error) {
-    if (error?.code === "EOUTBOXCHANGED") throw error;
-    if (error?.code !== "ENOENT") {
-      // Keep the durable integrity signal even when the original file cannot be moved.
-      message = `${message}; quarantine failed: ${error?.message ?? String(error)}`;
-    }
+    return error?.code === "ENOENT" ? false : null;
   }
-  const fresh = { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [] };
-  await atomicWrite(pendingFile, JSON.stringify({ ...fresh, updated_at: now }));
-  return fresh;
+  if (!Number.isSafeInteger(holder?.pid) || holder.pid <= 0) return null;
+  try {
+    process.kill(holder.pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
 }
 
-/**
- * Reads the required-notice outbox. Every entry in pending/seen/resolved must have the full outbox
- * record shape; a parseable-but-malformed outbox is as corrupt as invalid JSON. A corrupt outbox is
- * quarantined here (renamed aside) and replaced by a fresh valid outbox holding a pending integrity
- * notice, so callers only ever see well-formed entries. This is the one write a read may make.
- */
-export async function readPendingNotifications(descartesPaths, { recoveryAttempts = 2 } = {}) {
-  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const now = new Date().toISOString();
+async function withOutboxLock(pendingFile, fn) {
+  const lockFile = `${pendingFile}.lock`;
+  await ensureParent(lockFile);
+  const token = crypto.randomUUID();
+  const started = Date.now();
+  let delayMs = 2;
+  for (;;) {
+    try {
+      const handle = await fs.open(lockFile, "wx", 0o600);
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
+      } finally {
+        await handle.close();
+      }
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    let observed;
+    try {
+      observed = await fs.readFile(lockFile, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    const alive = await outboxLockHolderAlive(lockFile);
+    let ageMs = 0;
+    try {
+      ageMs = Date.now() - (await fs.stat(lockFile)).mtimeMs;
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    const stale = alive === false || (alive === null && ageMs > OUTBOX_LOCK_UNREADABLE_STALE_MS) || Date.now() - started > OUTBOX_LOCK_WAIT_MS;
+    if (stale) {
+      // Break only the lock we judged stale: a fresh lock taken meanwhile has different content.
+      const current = await fs.readFile(lockFile, "utf8").catch(() => undefined);
+      if (current === observed) await fs.unlink(lockFile).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+      continue;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    delayMs = Math.min(delayMs * 2, 50);
+  }
+  try {
+    return await fn();
+  } finally {
+    const current = await fs.readFile(lockFile, "utf8").catch(() => undefined);
+    let holder;
+    try { holder = JSON.parse(current ?? "null"); } catch { holder = null; }
+    if (holder?.token === token) await fs.unlink(lockFile).catch(() => {});
+  }
+}
+
+async function parseOutbox(pendingFile) {
   let text;
   try {
     text = await fs.readFile(pendingFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { state: { v: 1, pending: [], seen: [], resolved: [] } };
+    return { error };
+  }
+  try {
     const parsed = JSON.parse(text);
     if (parsed?.v !== 1 || !Array.isArray(parsed.pending) || !Array.isArray(parsed.seen) || !Array.isArray(parsed.resolved)) {
       throw new Error("notification outbox has an invalid schema");
@@ -100,24 +150,53 @@ export async function readPendingNotifications(descartesPaths, { recoveryAttempt
       const invalidIndex = entries.findIndex((entry) => !isNotificationEntry(entry, section));
       if (invalidIndex >= 0) throw new Error(`notification outbox has an invalid ${section} entry at index ${invalidIndex}`);
     }
-    return {
-      v: 1,
-      pending: parsed.pending,
-      seen: parsed.seen,
-      resolved: parsed.resolved,
-    };
+    return { state: { v: 1, pending: parsed.pending, seen: parsed.seen, resolved: parsed.resolved } };
   } catch (error) {
-    if (error?.code === "ENOENT") return { v: 1, pending: [], seen: [], resolved: [] };
-    const message = error?.message ?? String(error);
+    return { error };
+  }
+}
+
+function unrecoveredOutbox(message, now) {
+  // The integrity notice is surfaced in memory; a writer must quarantine before writing.
+  return { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message } };
+}
+
+/** Must hold the outbox lock. Re-reads; a still-corrupt outbox is quarantined and replaced. */
+async function loadOutboxLocked(pendingFile) {
+  const now = new Date().toISOString();
+  const read = await parseOutbox(pendingFile);
+  if (read.state) return read.state;
+  let message = read.error?.message ?? String(read.error);
+  try {
     try {
-      const fresh = await recoverCorruptNotificationOutbox(pendingFile, message, now, text);
-      return { ...fresh, tamper: { kind: "notification_outbox_corrupt", message }, recovered: true };
-    } catch (recoveryError) {
-      if (recoveryError?.code === "EOUTBOXCHANGED" && recoveryAttempts > 1) return readPendingNotifications(descartesPaths, { recoveryAttempts: recoveryAttempts - 1 });
-      const failure = `${message}; recovery failed: ${recoveryError?.message ?? String(recoveryError)}`;
-      // Unrecovered: the integrity notice is surfaced in memory; writers must quarantine before writing.
-      return { v: 1, pending: [outboxIntegrityEntry("corrupt", failure, now)], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message: failure } };
+      await fs.rename(pendingFile, `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`);
+    } catch (error) {
+      // Keep the durable integrity signal even when the original file cannot be moved.
+      if (error?.code !== "ENOENT") message = `${message}; quarantine failed: ${error?.message ?? String(error)}`;
     }
+    const fresh = { v: 1, pending: [outboxIntegrityEntry("corrupt", message, now)], seen: [], resolved: [] };
+    await atomicWrite(pendingFile, JSON.stringify({ ...fresh, updated_at: now }));
+    return { ...fresh, tamper: { kind: "notification_outbox_corrupt", message }, recovered: true };
+  } catch (recoveryError) {
+    return unrecoveredOutbox(`${message}; recovery failed: ${recoveryError?.message ?? String(recoveryError)}`, now);
+  }
+}
+
+/**
+ * Reads the required-notice outbox. Every entry in pending/seen/resolved must have the full outbox
+ * record shape; a parseable-but-malformed outbox is as corrupt as invalid JSON. A corrupt outbox is
+ * quarantined (renamed aside, under the outbox lock, after a re-read) and replaced by a fresh valid
+ * outbox holding a pending integrity notice, so callers only ever see well-formed entries. This is
+ * the one write a read may make.
+ */
+export async function readPendingNotifications(descartesPaths) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const read = await parseOutbox(pendingFile);
+  if (read.state) return read.state;
+  try {
+    return await withOutboxLock(pendingFile, () => loadOutboxLocked(pendingFile));
+  } catch (lockError) {
+    return unrecoveredOutbox(`${read.error?.message ?? String(read.error)}; recovery failed: ${lockError?.message ?? String(lockError)}`, new Date().toISOString());
   }
 }
 
@@ -160,55 +239,59 @@ async function writePendingState(pendingFile, state, now) {
 export async function queuePendingNotification(descartesPaths, decision, options = {}) {
   if (!options.requiredNoticeId) throw new Error("required notification needs requiredNoticeId");
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  let state = await readPendingNotifications(descartesPaths);
-  const now = options.now ?? new Date().toISOString();
-  if (state.tamper && !state.recovered) {
-    const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
-    await fs.rename(pendingFile, quarantine).catch((error) => {
-      if (error?.code !== "ENOENT") throw error;
-    });
-    state = { v: 1, pending: [outboxIntegrityEntry("corrupt", state.tamper.message, now)], seen: [], resolved: [] };
-  }
-  const payload = normalizeNotificationPayload(decision, options);
-  const id = String(options.requiredNoticeId);
-  const existing = state.pending.find((entry) => entry.id === id);
-  const entry = existing ?? {
-    id,
-    digest: pendingNoticeDigest(decision, options),
-    rule_id: options.ruleId === undefined || options.ruleId === null ? null : String(options.ruleId),
-    first_seen_at: normalizeIso(options.now ?? new Date().toISOString(), "now"),
-    severity: payload.severity,
-    title: payload.title,
-    body: payload.body,
-    attempts: 0,
-    last_status: null,
-  };
-  if (!existing) {
-    const summary = state.pending.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
-    if (state.pending.length < MAX_PENDING_NOTIFICATIONS) {
-      state.pending.push(entry);
-    } else if (summary) {
-      state.pending = state.pending.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
-      state.pending.push(updateOverflowSummary(summary, 1, now));
-    } else {
-      const displaced = Math.max(1, state.pending.length - (MAX_PENDING_NOTIFICATIONS - 1));
-      state.pending = state.pending.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
-      state.pending.push(updateOverflowSummary(undefined, displaced + 1, now));
+  return withOutboxLock(pendingFile, async () => {
+    let state = await loadOutboxLocked(pendingFile);
+    const now = options.now ?? new Date().toISOString();
+    if (state.tamper && !state.recovered) {
+      const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
+      await fs.rename(pendingFile, quarantine).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+      state = { v: 1, pending: [outboxIntegrityEntry("corrupt", state.tamper.message, now)], seen: [], resolved: [] };
     }
-  }
-  await writePendingState(pendingFile, state, now);
-  return existing ?? entry;
+    const payload = normalizeNotificationPayload(decision, options);
+    const id = String(options.requiredNoticeId);
+    const existing = state.pending.find((entry) => entry.id === id);
+    const entry = existing ?? {
+      id,
+      digest: pendingNoticeDigest(decision, options),
+      rule_id: options.ruleId === undefined || options.ruleId === null ? null : String(options.ruleId),
+      first_seen_at: normalizeIso(options.now ?? new Date().toISOString(), "now"),
+      severity: payload.severity,
+      title: payload.title,
+      body: payload.body,
+      attempts: 0,
+      last_status: null,
+    };
+    if (!existing) {
+      const summary = state.pending.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
+      if (state.pending.length < MAX_PENDING_NOTIFICATIONS) {
+        state.pending.push(entry);
+      } else if (summary) {
+        state.pending = state.pending.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+        state.pending.push(updateOverflowSummary(summary, 1, now));
+      } else {
+        const displaced = Math.max(1, state.pending.length - (MAX_PENDING_NOTIFICATIONS - 1));
+        state.pending = state.pending.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+        state.pending.push(updateOverflowSummary(undefined, displaced + 1, now));
+      }
+    }
+    await writePendingState(pendingFile, state, now);
+    return existing ?? entry;
+  });
 }
 
 async function settlePendingNotification(descartesPaths, id, status, now) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const state = await readPendingNotifications(descartesPaths);
-  if (state.tamper && !state.recovered) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
-  const index = state.pending.findIndex((entry) => entry.id === id);
-  if (index < 0) return;
-  const [entry] = state.pending.splice(index, 1);
-  state.resolved.push({ ...entry, resolved_at: now, resolution: status });
-  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+  return withOutboxLock(pendingFile, async () => {
+    const state = await loadOutboxLocked(pendingFile);
+    if (state.tamper && !state.recovered) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
+    const index = state.pending.findIndex((entry) => entry.id === id);
+    if (index < 0) return;
+    const [entry] = state.pending.splice(index, 1);
+    state.resolved.push({ ...entry, resolved_at: normalizeIso(now, "resolved_at"), resolution: String(status || "resolved") });
+    await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+  });
 }
 
 export async function resolvePendingNotification(descartesPaths, id, status, now = new Date().toISOString()) {
@@ -217,14 +300,17 @@ export async function resolvePendingNotification(descartesPaths, id, status, now
 
 export async function viewPendingNotifications(descartesPaths, { now = new Date().toISOString() } = {}) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const state = await readPendingNotifications(descartesPaths);
-  // An unrecovered corrupt outbox is left in place for a writer to quarantine; never overwrite it here.
-  if (state.tamper && !state.recovered) return [];
-  const { entries: pending } = filterNotificationEntries(state.pending, "pending");
-  if (pending.length === 0) return [];
-  const viewed = pending.map((entry) => ({ ...entry, seen_at: now, resolution: "viewed" }));
-  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: [], seen: [...state.seen, ...viewed].slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
-  return viewed;
+  return withOutboxLock(pendingFile, async () => {
+    const state = await loadOutboxLocked(pendingFile);
+    // An unrecovered corrupt outbox is left in place for a writer to quarantine; never overwrite it here.
+    if (state.tamper && !state.recovered) return [];
+    const { entries: pending } = filterNotificationEntries(state.pending, "pending");
+    if (pending.length === 0) return [];
+    const seenAt = normalizeIso(now, "seen_at");
+    const viewed = pending.map((entry) => ({ ...entry, seen_at: seenAt, resolution: "viewed" }));
+    await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: [], seen: [...state.seen, ...viewed].slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+    return viewed;
+  });
 }
 
 async function ensureParent(file) {
@@ -605,13 +691,15 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
       const cliViewed = record?.status === "cli_only" && options.allowCliOnly === true;
       if (delivered || cliViewed) await settlePendingNotification(descartesPaths, options.requiredNoticeId, delivered ? "delivered" : "cli_only", now);
       else {
-        const state = await readPendingNotifications(descartesPaths);
-        const entry = state.tamper && !state.recovered ? undefined : state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
-        if (entry) {
+        const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+        await withOutboxLock(pendingFile, async () => {
+          const state = await loadOutboxLocked(pendingFile);
+          const entry = state.tamper && !state.recovered ? undefined : state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
+          if (!entry) return;
           entry.attempts = (entry.attempts ?? 0) + 1;
-          entry.last_status = record?.status ?? "error";
-          await atomicWrite(resolveNotificationDeliveryPaths(descartesPaths).pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
-        }
+          entry.last_status = typeof record?.status === "string" ? record.status : "error";
+          await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+        });
       }
     }
     return record;
