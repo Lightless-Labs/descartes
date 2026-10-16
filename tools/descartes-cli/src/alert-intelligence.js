@@ -10,6 +10,7 @@ import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseli
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
 import { SCHEDULED_JOB_APPEARED_RULE_ID } from "./persistence-baseline.js";
 import { CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
+import { NOTIFICATION_ADAPTER_ROUTE } from "./notification-delivery.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -1224,7 +1225,7 @@ export async function deliverDueAlertNotifications(descartesPaths, evaluation, o
     metric: { fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
     llm: { status: config.enabled ? "no_due_alerts" : "disabled", fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
   };
-  const breakers = new Set();
+  const breakers = options.routeBreakers ?? new Set();
   const emitSession = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
   const emitMetric = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
@@ -1263,11 +1264,15 @@ export async function deliverDueAlertNotifications(descartesPaths, evaluation, o
       target.failed.push(item.alert.id);
       target.route_failed = true;
       breakers.add(item.route);
+      if (item.route === "session" || item.route === "metric") breakers.add(NOTIFICATION_ADAPTER_ROUTE);
       continue;
     }
     appendRouteResult(target, result);
     deliveryOutcomes.push(...(result?.delivery_outcomes ?? []));
-    if (target.route_failed) breakers.add(item.route);
+    if (target.route_failed) {
+      breakers.add(item.route);
+      if (item.route === "session" || item.route === "metric") breakers.add(NOTIFICATION_ADAPTER_ROUTE);
+    }
   }
 
   if (deliveryOutcomes.length > 0 && descartesPaths?.stateDir) {

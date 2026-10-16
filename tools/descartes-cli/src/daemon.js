@@ -1189,27 +1189,24 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
   let notificationOutbox;
+  let notificationOutboxCanDrain = false;
+  const notificationRouteBreakers = new Set();
   try {
     const recovered = await recoverNotificationOutbox(descartesPaths);
     if (recovered.outbox_error) {
       notificationOutbox = { status: "warning", error: recovered.outbox_error, changed: false };
     } else {
       const retention = await retainNotificationOutbox(descartesPaths, { now: ts });
-      const drain = await drainDueNotificationOutbox(descartesPaths, {
-        now: ts,
-        ...(options.deliverNotification ? { deliverNotification: options.deliverNotification } : {}),
-        ...(options.notificationDeliveryOptions ?? {}),
-      });
+      notificationOutboxCanDrain = true;
       notificationOutbox = {
-        status: recovered.recovered || retention.status === "warning" || drain.status === "warning" ? "warning" : "ok",
+        status: recovered.recovered || retention.status === "warning" ? "warning" : "ok",
         ...(recovered.recovered ? { recovery: "corrupt_outbox_quarantined" } : {}),
         ...(retention.status === "warning" ? { error: retention.outbox_error } : {}),
-        ...(drain.status === "warning" ? { error: drain.error ?? { message: "one or more due notices failed" } } : {}),
         ...(retention.dropped > 0 ? { dropped: retention.dropped, overflowed: retention.overflowed } : {}),
         removed_archives: retention.removed_archives ?? 0,
-        drained: drain.attempted,
-        delivered: drain.delivered,
-        failed: drain.failed,
+        drained: 0,
+        delivered: 0,
+        failed: 0,
       };
     }
   } catch (error) {
@@ -2525,6 +2522,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           deliverSessionAlerts: options.deliverSessionAlerts,
           deliverMetricAlertFallback: options.deliverMetricAlertFallback,
           adjudicateAlerts: options.adjudicateAlerts,
+          routeBreakers: notificationRouteBreakers,
         }),
         undefined,
       )
@@ -2652,6 +2650,51 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       alertDigest = await (options.maybeSendAlertDigest ?? maybeSendAlertDigest)(descartesPaths, { now: ts, deliverNotification: options.deliverNotification ?? deliverNotificationDecision });
     } catch (error) {
       alertDigest = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  // Required-notice retries are deliberately last in the tick: collection, detection, and alert
+  // delivery must not wait behind a slow adapter. They share alert delivery's route circuit, so one
+  // adapter failure/unavailability costs at most one attempt for that route and the skipped notices
+  // receive their normal backoff instead of being made to disappear.
+  if (notificationOutboxCanDrain) {
+    try {
+      const drain = await drainDueNotificationOutbox(descartesPaths, {
+        now: ts,
+        routeBreakers: notificationRouteBreakers,
+        ...(options.deliverNotification ? { deliverNotification: options.deliverNotification } : {}),
+        ...(options.notificationDeliveryOptions ?? {}),
+      });
+      notificationOutbox = {
+        ...notificationOutbox,
+        status: notificationOutbox.status === "warning" || drain.status === "warning" ? "warning" : "ok",
+        ...(drain.status === "warning" ? { error: drain.error ?? { message: "one or more due notices failed" } } : {}),
+        drained: drain.attempted,
+        delivered: drain.delivered,
+        failed: drain.failed,
+        ...(drain.skipped > 0 ? { skipped: drain.skipped } : {}),
+      };
+    } catch (error) {
+      notificationOutbox = {
+        ...notificationOutbox,
+        status: "warning",
+        error: error instanceof Error ? error.message : String(error),
+      };
+      console.warn(`[daemon] notification outbox drain failed (${notificationOutbox.error}); it remains unchanged`);
+    }
+    // The first status write intentionally precedes detection. Refresh it after the deferred drain
+    // so the durable tick status contains the final outbox counters without moving adapter work
+    // back in front of collection or detection.
+    const finalStatus = {
+      ...status,
+      state: notificationOutbox.status === "warning" ? "error" : status.state,
+      notification_outbox: notificationOutbox,
+    };
+    try {
+      status = await persistStatus(descartesPaths, finalStatus);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[daemon] final notification outbox status write failed this tick (${message})`);
+      status = { ...finalStatus, state: "error", storage_write_error: combineErrors(finalStatus.storage_write_error, message) };
     }
   }
   let pendingJournal;

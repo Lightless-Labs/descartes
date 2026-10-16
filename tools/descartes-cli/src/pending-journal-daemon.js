@@ -39,8 +39,8 @@ export async function journalWitness(descartesPaths, family) {
 
 // One integrity notice per epoch (I54 step 5), outside any attention budget. Whoever opens the epoch
 // (the pre-pass, or label ingestion opening a journal on its own) sends it.
-// A delivery that returned a failure status was not notified (review L2). No per-notice retry is kept
-// across ticks: the digest lists every open epoch and retries its own push until it is delivered.
+// A delivery that returned a failure status was not notified (review L2). The daemon-owned retained
+// outbox keeps the notice due with backoff and retries it on a later tick.
 const FAILED_DELIVERY_STATUSES = new Set(["error", "unavailable", "disabled", "retry_pending"]);
 
 export function notificationOutcome(result) {

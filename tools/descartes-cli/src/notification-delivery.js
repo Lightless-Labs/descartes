@@ -18,6 +18,8 @@ export const NOTIFICATION_RETRY_CAP_MS = 60 * 60 * 1000;
 export const MAX_QUARANTINED_NOTIFICATION_OUTBOX_ARCHIVES = 10;
 export const NOTIFICATION_OUTBOX_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID = "integrity.notification_outbox";
+// Shared with alert-intelligence.js: this is the adapter-facing route for retained notices.
+export const NOTIFICATION_ADAPTER_ROUTE = "notification";
 const NOTIFICATION_OUTBOX_OVERFLOW_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:overflow`;
 const NOTIFICATION_OUTBOX_CORRUPT_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:corrupt`;
 
@@ -378,7 +380,13 @@ function noticeAttemptDue(entry, nowMs) {
  * cannot make an integrity or overflow notice disappear between ticks.
  */
 export async function drainDueNotificationOutbox(descartesPaths, options = {}) {
-  const { now: rawNow = new Date().toISOString(), deliverNotification, ...deliveryOptions } = options;
+  const {
+    now: rawNow = new Date().toISOString(),
+    deliverNotification,
+    routeBreakers = new Set(),
+    routeForNotice,
+    ...deliveryOptions
+  } = options;
   const now = normalizeIso(rawNow, "now");
   const recovered = await recoverNotificationOutbox(descartesPaths);
   if (recovered.outbox_error) return { status: "warning", error: recovered.outbox_error, attempted: 0, delivered: 0, failed: 0 };
@@ -387,7 +395,19 @@ export async function drainDueNotificationOutbox(descartesPaths, options = {}) {
   const usesNormalPath = delivery === deliverNotificationDecision;
   let delivered = 0;
   let failed = 0;
+  let skipped = 0;
   for (const entry of due) {
+    const route = routeForNotice?.(entry) ?? deliveryOptions.route ?? NOTIFICATION_ADAPTER_ROUTE;
+    if (routeBreakers.has(route)) {
+      skipped += 1;
+      failed += 1;
+      try {
+        await recordNotificationFailure(descartesPaths, entry.id, `${route}_route_circuit_open`, now);
+      } catch {
+        // A later tick can retry if the outbox itself became unavailable while recording this skip.
+      }
+      continue;
+    }
     const decision = { notify: true, severity: entry.severity, title: entry.title, body: entry.body };
     const attemptOptions = {
       ...deliveryOptions,
@@ -409,7 +429,10 @@ export async function drainDueNotificationOutbox(descartesPaths, options = {}) {
     }
     const reachedOperator = result?.status === "delivered" || result?.status === "cli_only";
     if (reachedOperator) delivered += 1;
-    else failed += 1;
+    else {
+      failed += 1;
+      routeBreakers.add(route);
+    }
     // The production delivery function records its own result. Injected delivery seams do not,
     // so the daemon records their outcome here while keeping focused tests deterministic.
     if (!usesNormalPath) {
@@ -421,7 +444,7 @@ export async function drainDueNotificationOutbox(descartesPaths, options = {}) {
       }
     }
   }
-  return { status: failed > 0 ? "warning" : "ok", attempted: due.length, delivered, failed };
+  return { status: failed > 0 ? "warning" : "ok", attempted: due.length, delivered, failed, skipped };
 }
 
 /** Selects the read-only operator view. It never changes the outbox. */
