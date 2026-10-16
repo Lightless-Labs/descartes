@@ -8,7 +8,7 @@ import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricA
 import { readVerifiedAlertTransitions, reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
-import { deliverNotificationDecision, recoverNotificationOutbox, retainNotificationOutbox } from "./notification-delivery.js";
+import { deliverNotificationDecision, drainDueNotificationOutbox, recoverNotificationOutbox, retainNotificationOutbox } from "./notification-delivery.js";
 import { deliverPendingDiscontinuityNotice, deliverPendingJournalNotices, finishPendingJournalTick, notificationOutcome, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID, writeAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
@@ -1195,11 +1195,20 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       notificationOutbox = { status: "warning", error: recovered.outbox_error, changed: false };
     } else {
       const retention = await retainNotificationOutbox(descartesPaths, { now: ts });
+      const drain = await drainDueNotificationOutbox(descartesPaths, {
+        now: ts,
+        ...(options.deliverNotification ? { deliverNotification: options.deliverNotification } : {}),
+        ...(options.notificationDeliveryOptions ?? {}),
+      });
       notificationOutbox = {
-        status: recovered.recovered || retention.status === "warning" ? "warning" : "ok",
+        status: recovered.recovered || retention.status === "warning" || drain.status === "warning" ? "warning" : "ok",
         ...(recovered.recovered ? { recovery: "corrupt_outbox_quarantined" } : {}),
         ...(retention.status === "warning" ? { error: retention.outbox_error } : {}),
+        ...(drain.status === "warning" ? { error: drain.error ?? { message: "one or more due notices failed" } } : {}),
         ...(retention.dropped > 0 ? { dropped: retention.dropped, overflowed: retention.overflowed } : {}),
+        drained: drain.attempted,
+        delivered: drain.delivered,
+        failed: drain.failed,
       };
     }
   } catch (error) {

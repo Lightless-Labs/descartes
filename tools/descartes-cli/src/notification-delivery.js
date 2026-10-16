@@ -310,6 +310,58 @@ function noticeAttemptDue(entry, nowMs) {
   return !Number.isFinite(nextAttemptMs) || nextAttemptMs <= nowMs;
 }
 
+/**
+ * Daemon-owned retry pass for every retained required notice that is due. Producers may enqueue
+ * notices through the normal delivery path, but retry ownership stays here so a failed producer
+ * cannot make an integrity or overflow notice disappear between ticks.
+ */
+export async function drainDueNotificationOutbox(descartesPaths, options = {}) {
+  const { now: rawNow = new Date().toISOString(), deliverNotification, ...deliveryOptions } = options;
+  const now = normalizeIso(rawNow, "now");
+  const recovered = await recoverNotificationOutbox(descartesPaths);
+  if (recovered.outbox_error) return { status: "warning", error: recovered.outbox_error, attempted: 0, delivered: 0, failed: 0 };
+  const due = recovered.notices.filter((entry) => noticeAttemptDue(entry, Date.parse(now)));
+  const delivery = deliverNotification ?? deliverNotificationDecision;
+  const usesNormalPath = delivery === deliverNotificationDecision;
+  let delivered = 0;
+  let failed = 0;
+  for (const entry of due) {
+    const decision = { notify: true, severity: entry.severity, title: entry.title, body: entry.body };
+    const attemptOptions = {
+      ...deliveryOptions,
+      now,
+      required: true,
+      requiredNoticeId: entry.id,
+      ruleId: entry.rule_id,
+    };
+    let result;
+    try {
+      result = await delivery(descartesPaths, decision, attemptOptions);
+    } catch (error) {
+      result = { status: "error", error: error instanceof Error ? error.message : String(error) };
+      try {
+        await recordNotificationFailure(descartesPaths, entry.id, result.status, now);
+      } catch {
+        // Preserve the original drain failure; the next daemon tick will retry the retained entry.
+      }
+    }
+    const reachedOperator = result?.status === "delivered" || result?.status === "cli_only";
+    if (reachedOperator) delivered += 1;
+    else failed += 1;
+    // The production delivery function records its own result. Injected delivery seams do not,
+    // so the daemon records their outcome here while keeping focused tests deterministic.
+    if (!usesNormalPath) {
+      try {
+        if (reachedOperator) await settlePendingNotification(descartesPaths, entry.id, result.status, now);
+        else await recordNotificationFailure(descartesPaths, entry.id, result?.status ?? "error", now);
+      } catch {
+        // A later tick can retry if the outbox itself became unavailable while recording this one.
+      }
+    }
+  }
+  return { status: failed > 0 ? "warning" : "ok", attempted: due.length, delivered, failed };
+}
+
 /** Selects the read-only operator view. It never changes the outbox. */
 export function selectNotificationNoticeWindow(state, { now = new Date().toISOString() } = {}) {
   const nowMs = Date.parse(normalizeIso(now, "now"));
