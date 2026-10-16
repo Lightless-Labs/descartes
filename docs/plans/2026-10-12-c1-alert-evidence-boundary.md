@@ -46,12 +46,14 @@ valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are cl
   `<pendingFile>.lock`, JSON `{pid, token, at}`, created complete (temp file + `link()`, which fails
   if a lock exists — never empty); every outbox read-modify-write (queue, settle, view, attempt
   bookkeeping, corruption recovery) runs under it; recovery re-reads under the lock before
-  quarantining. A lock is stale when the holder pid in the *observed* content is dead or the lock is
-  older than 30 s (never because a waiter waited). Every lock removal — a holder's release (own
+  quarantining. A lock held by a **live** process is never broken, however old (gate round 5: an
+  unfenced 30 s lease let a paused holder resume and overwrite a newer writer). It is stale only when
+  the holder pid in the *observed* content is dead, or — probed with `ps -o etime=` once a lock is
+  >30 s old — the live process at that pid started after the lock's `at` (pid reuse). A waiter blocked
+  by a live holder fails loudly after 120 s instead of breaking the lock. Every lock removal — a holder's release (own
   token) or a stale break (exact observed content) — runs under a second `<lockFile>.break` lock and
   re-reads first, so nobody removes a lock other than the one they checked. Residual: the break lock's
-  own stale break is unserialized (needs a crashed/30 s-paused break-lock holder plus a three-way
-  race). `alerts list`/`digest` mark seen only the notice ids they rendered.
+  own dead-holder break is unserialized (needs a crashed break-lock holder plus a three-way race). `alerts list`/`digest` mark seen only the notice ids they rendered.
 
 The lock is **cooperative**: a same-UID writer that ignores it can still race or rewrite the outbox.
 That is the same deliberate same-UID forgery already out of scope above, not a new boundary.

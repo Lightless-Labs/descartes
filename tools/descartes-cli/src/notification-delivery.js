@@ -68,7 +68,14 @@ export function filterNotificationEntries(entries, section = "pending") {
 // happens only under a second "break" lock and only after re-reading the exact content, so no one
 // can remove a lock other than the one they checked: a fresh lock can only be created while none
 // exists, and every removal is serialized and verified.
-const OUTBOX_LOCK_LIVE_STALE_MS = 30_000;
+//
+// A lock held by a LIVE process is never broken, however old (an unfenced lease would let a paused
+// holder resume and overwrite a newer writer). It is stale only when its holder is dead, or when the
+// live process at that pid started after the lock was taken (pid reuse; checked with `ps` only once
+// a lock is old). A waiter blocked by a live holder fails loudly after a bounded wait instead.
+const OUTBOX_LOCK_REUSE_CHECK_MS = 30_000;
+const OUTBOX_LOCK_MAX_WAIT_MS = 120_000;
+const OUTBOX_LOCK_REUSE_SLACK_MS = 5_000;
 
 function lockHolder(content) {
   try {
@@ -108,11 +115,40 @@ async function createLockFile(lockFile, content) {
   }
 }
 
-// Staleness is a property of the observed lock (dead holder pid, or held implausibly long), never of
-// how long a waiter has waited: a live holder paused under memory pressure keeps its lock.
-async function acquireLockFile(lockFile, token, breakStale) {
+function parseElapsedMs(etime) {
+  const match = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(String(etime));
+  if (!match) return null;
+  const [, days = "0", hours = "0", minutes, seconds] = match;
+  return (((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000;
+}
+
+/** True when the live process now at `pid` started after `atIso` (so it cannot be the lock's holder). */
+async function lockPidReused(pid, atIso) {
+  const at = Date.parse(atIso);
+  if (!Number.isFinite(at)) return false;
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
+    const elapsedMs = parseElapsedMs(stdout);
+    if (elapsedMs === null) return false;
+    return Date.now() - elapsedMs > at + OUTBOX_LOCK_REUSE_SLACK_MS;
+  } catch {
+    return false;
+  }
+}
+
+async function lockIsStale(observed, ageMs) {
+  const holder = lockHolder(observed);
+  const alive = lockPidAlive(holder?.pid);
+  if (alive === false) return true;
+  if (alive === true && ageMs > OUTBOX_LOCK_REUSE_CHECK_MS) return lockPidReused(holder.pid, holder.at);
+  return false;
+}
+
+async function acquireLockFile(lockFile, token, breakStale, { maxWaitMs = OUTBOX_LOCK_MAX_WAIT_MS } = {}) {
   const content = JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() });
+  const started = Date.now();
   let delayMs = 2;
+  let reuseChecked;
   for (;;) {
     try {
       await createLockFile(lockFile, content);
@@ -129,9 +165,16 @@ async function acquireLockFile(lockFile, token, breakStale) {
       if (error?.code === "ENOENT") continue;
       throw error;
     }
-    if (lockPidAlive(lockHolder(observed)?.pid) === false || ageMs > OUTBOX_LOCK_LIVE_STALE_MS) {
+    // The pid-reuse probe spawns `ps`; run it at most once per observed lock.
+    const probeReuse = ageMs > OUTBOX_LOCK_REUSE_CHECK_MS && reuseChecked !== observed;
+    if (probeReuse) reuseChecked = observed;
+    if (lockPidAlive(lockHolder(observed)?.pid) === false || (probeReuse && await lockIsStale(observed, ageMs))) {
       await breakStale(observed);
       continue;
+    }
+    if (Date.now() - started > maxWaitMs) {
+      const holder = lockHolder(observed);
+      throw new Error(`notification outbox lock held by live pid ${holder?.pid ?? "unknown"} since ${holder?.at ?? "unknown"}; not breaking it (${lockFile})`);
     }
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     delayMs = Math.min(delayMs * 2, 50);
@@ -147,9 +190,9 @@ async function removeLockIf(lockFile, predicate) {
   }
 }
 
-// Serializes lock removal. Its own stale break is unserialized (residual: a break lock held by a
-// crashed process, or by one paused >30 s inside a removal of a few microseconds, can be removed
-// concurrently by two breakers; this needs that crash plus a three-way race).
+// Serializes lock removal. Its own stale break is unserialized (residual: a break lock left by a
+// crashed process can be removed concurrently by two breakers; this needs that crash plus a three-way
+// race).
 async function withOutboxBreakLock(lockFile, fn) {
   const breakFile = `${lockFile}.break`;
   const token = crypto.randomUUID();
@@ -161,11 +204,11 @@ async function withOutboxBreakLock(lockFile, fn) {
   }
 }
 
-async function withOutboxLock(pendingFile, fn) {
+async function withOutboxLock(pendingFile, fn, { maxWaitMs } = {}) {
   const lockFile = `${pendingFile}.lock`;
   await ensureParent(lockFile);
   const token = crypto.randomUUID();
-  await acquireLockFile(lockFile, token, (observed) => withOutboxBreakLock(lockFile, () => removeLockIf(lockFile, (current) => current === observed)));
+  await acquireLockFile(lockFile, token, (observed) => withOutboxBreakLock(lockFile, () => removeLockIf(lockFile, (current) => current === observed)), { maxWaitMs });
   try {
     return await fn();
   } finally {
@@ -279,9 +322,9 @@ async function writePendingState(pendingFile, state, now) {
 export async function queuePendingNotification(descartesPaths, decision, options = {}) {
   if (!options.requiredNoticeId) throw new Error("required notification needs requiredNoticeId");
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   return withOutboxLock(pendingFile, async () => {
     let state = await loadOutboxLocked(pendingFile);
-    const now = options.now ?? new Date().toISOString();
     if (state.tamper && !state.recovered) {
       const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
       await fs.rename(pendingFile, quarantine).catch((error) => {
@@ -296,7 +339,7 @@ export async function queuePendingNotification(descartesPaths, decision, options
       id,
       digest: pendingNoticeDigest(decision, options),
       rule_id: options.ruleId === undefined || options.ruleId === null ? null : String(options.ruleId),
-      first_seen_at: normalizeIso(options.now ?? new Date().toISOString(), "now"),
+      first_seen_at: now,
       severity: payload.severity,
       title: payload.title,
       body: payload.body,
@@ -318,7 +361,7 @@ export async function queuePendingNotification(descartesPaths, decision, options
     }
     await writePendingState(pendingFile, state, now);
     return existing ?? entry;
-  });
+  }, { maxWaitMs: options.lockWaitMs });
 }
 
 async function settlePendingNotification(descartesPaths, id, status, now) {

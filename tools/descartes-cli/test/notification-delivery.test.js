@@ -704,3 +704,60 @@ test("outbox lock stress: heavy concurrent queues and views never lose or duplic
     assert.equal(names.some((name) => name.includes(".lock") || name.includes(".tmp")), false, names.join(","));
   }
 });
+
+test("an old lock held by a live process is never broken (no lease preemption of a paused writer)", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  const lockFile = `${pendingFile}.lock`;
+  // Taken after this (live) process started, so it is the holder's lock, merely old by mtime.
+  const held = JSON.stringify({ pid: process.pid, token: "paused-holder", at: new Date().toISOString() });
+  await fs.writeFile(lockFile, held);
+  const old = new Date(Date.now() - 120_000);
+  await fs.utimes(lockFile, old, old);
+  let landed = false;
+  const queued = queuePendingNotification(paths, { notify: true, title: "Waiter", body: "Body" }, { now: "2026-05-29T00:17:00.000Z", requiredNoticeId: "notice:behind-paused", ruleId: "integrity.test" }).then(() => { landed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(landed, false, "a waiter must not preempt a live holder however old its lock is");
+  assert.equal(await fs.readFile(lockFile, "utf8"), held);
+  await fs.unlink(lockFile);
+  await queued;
+  assert.deepEqual((await readPendingNotifications(paths)).pending.map((entry) => entry.id), ["notice:behind-paused"]);
+});
+
+test("a lock whose pid was reused by a process started after the lock is stale", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  const lockFile = `${pendingFile}.lock`;
+  // This process is alive but started long after the lock's recorded acquisition time.
+  await fs.writeFile(lockFile, JSON.stringify({ pid: process.pid, token: "reused", at: "2001-01-01T00:00:00.000Z" }));
+  const old = new Date(Date.now() - 120_000);
+  await fs.utimes(lockFile, old, old);
+  await queuePendingNotification(paths, { notify: true, title: "After reuse", body: "Body" }, { now: "2026-05-29T00:18:00.000Z", requiredNoticeId: "notice:after-reuse", ruleId: "integrity.test" });
+  assert.deepEqual((await readPendingNotifications(paths)).pending.map((entry) => entry.id), ["notice:after-reuse"]);
+});
+
+test("a waiter blocked by a live holder fails loudly after its bounded wait instead of breaking the lock", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  const lockFile = `${pendingFile}.lock`;
+  const held = JSON.stringify({ pid: process.pid, token: "busy", at: new Date().toISOString() });
+  await fs.writeFile(lockFile, held);
+  await assert.rejects(
+    () => queuePendingNotification(paths, { notify: true, title: "Blocked", body: "Body" }, { now: "2026-05-29T00:19:00.000Z", requiredNoticeId: "notice:blocked", ruleId: "integrity.test", lockWaitMs: 200 }),
+    /notification outbox lock held/,
+  );
+  assert.equal(await fs.readFile(lockFile, "utf8"), held);
+});
+
+test("an overflow summary created with a non-ISO now still passes outbox validation", async () => {
+  const paths = await tempPaths();
+  for (let index = 0; index < 513; index += 1) {
+    await queuePendingNotification(paths, { notify: true, title: `N ${index}`, body: "Body" }, { now: 0, requiredNoticeId: `notice:epoch:${index}`, ruleId: "integrity.test" });
+  }
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.tamper, undefined);
+  assert.ok(state.pending.some((entry) => entry.rule_id === "integrity.notification_outbox" && entry.first_seen_at === "1970-01-01T00:00:00.000Z"));
+});
