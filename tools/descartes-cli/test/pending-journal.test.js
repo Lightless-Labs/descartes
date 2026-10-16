@@ -561,14 +561,14 @@ test("a discontinuity notice that cannot even be queued is loud: warned and carr
   await fs.writeFile(journalFile, "{not json\n{}\n");
   const prePass = await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(2), ts: iso(2), families: ["session"] });
   const warn = t.mock.method(console, "warn", () => {});
-  await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => { throw new Error("notification outbox lock held by live pid 1"); } });
+  await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => { throw new Error("notification persistence unavailable"); } });
   assert.equal(prePass.families.session.report.notified, false);
   assert.equal(prePass.families.session.report.notify_queued, false);
   assert.ok(warn.mock.calls.some((call) => /discontinuity notice failed and may not be queued/.test(String(call.arguments[0]))));
   const summary = await finishPendingJournalTick(paths, prePass, { ts: iso(2), alertsPersisted: true });
   assert.equal(summary.session.notified, false);
   assert.equal(summary.session.notify_status, "error");
-  assert.match(summary.session.notify_error, /outbox lock/);
+  assert.match(summary.session.notify_error, /notification persistence unavailable/);
 });
 
 // Adversarial review L4: at a chain-level loss, the label log's quarantining labels are consulted, so a

@@ -142,7 +142,9 @@ test("digest survives a structurally malformed outbox and reports the integrity 
   await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null, { title: 3 }], seen: [], resolved: [] }));
   const digest = await buildAlertDigest(paths, { now: iso(HOUR) });
   assert.deepEqual(digest.notifications.pending.map((notice) => notice.rule_id), ["integrity.notification_outbox"]);
+  assert.equal(digest.notifications.corrupt, true);
   assert.match(renderAlertDigest(digest), /required notification pending: Descartes: required notification outbox corrupt/);
   // A persisted digest re-rendered with odd notices still renders.
   assert.doesNotThrow(() => renderAlertDigest({ ...digest, notifications: { pending: [null, 5, { title: "x" }] } }));
+  assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false);
 });

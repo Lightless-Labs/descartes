@@ -79,7 +79,7 @@ test("alerts list evaluates local history and prints active alerts", async () =>
   assert.match(outputs[0], /disk/i);
 });
 
-test("alerts list quarantines a malformed pending notice and still renders present alerts", async () => {
+test("alerts list renders present alerts and reports a malformed outbox without quarantining it", async () => {
   const paths = await tempPaths();
   const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
   await fs.mkdir(path.dirname(pendingFile), { recursive: true });
@@ -92,10 +92,11 @@ test("alerts list quarantines a malformed pending notice and still renders prese
   assert.match(outputs[0], /^Alerts \(\d+ active\)/);
   assert.match(outputs[0], /\[warning\/active\] No recent metric samples/);
   assert.match(outputs[0], /Required notices pending: 1/);
-  assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")));
+  assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false);
   const state = JSON.parse(await fs.readFile(pendingFile, "utf8"));
-  assert.equal(state.pending.length, 0, "the list view records the queued integrity notice as seen after rendering");
-  assert.equal(state.seen[0].rule_id, "integrity.notification_outbox");
+  assert.equal(state.pending.length, 1, "the CLI never writes the corrupt outbox");
+  const seenLog = await fs.readFile(path.join(paths.stateDir, "alerts", "notification-seen.jsonl"), "utf8");
+  assert.match(seenLog, /notification_outbox:corrupt/);
 });
 
 test("alert list renderer skips odd pending notices and counts them without hiding alerts", () => {
