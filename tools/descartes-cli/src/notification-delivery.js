@@ -61,98 +61,115 @@ export function filterNotificationEntries(entries, section = "pending") {
 // runs under one cooperative lock file, so a writer never acts on a stale read: recovery re-reads
 // under the lock before quarantining, and concurrent queues/views never lose each other's notices.
 // Cooperative only: a same-UID writer that ignores the lock is out of scope (evidence boundary).
+//
+// Lock files are created complete (content written to a temp file, then link()ed into place, which
+// fails if the lock exists), so a lock is never empty. Liveness is judged from the content a waiter
+// observed, never from a re-read. Removing a lock (a holder's release, or breaking a stale one)
+// happens only under a second "break" lock and only after re-reading the exact content, so no one
+// can remove a lock other than the one they checked: a fresh lock can only be created while none
+// exists, and every removal is serialized and verified.
 const OUTBOX_LOCK_LIVE_STALE_MS = 30_000;
-const OUTBOX_LOCK_UNREADABLE_STALE_MS = 2_000;
 
-async function outboxLockHolderAlive(lockFile) {
-  let holder;
+function lockHolder(content) {
   try {
-    holder = JSON.parse(await fs.readFile(lockFile, "utf8"));
-  } catch (error) {
-    return error?.code === "ENOENT" ? false : null;
+    const holder = JSON.parse(content);
+    return holder && typeof holder === "object" && !Array.isArray(holder) ? holder : null;
+  } catch {
+    return null;
   }
-  if (!Number.isSafeInteger(holder?.pid) || holder.pid <= 0) return null;
+}
+
+function lockPidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   try {
-    process.kill(holder.pid, 0);
+    process.kill(pid, 0);
     return true;
   } catch (error) {
     return error?.code === "EPERM";
   }
 }
 
-// Breaks a lock judged stale by first CLAIMING it (an atomic rename), so two waiters breaking the
-// same stale lock cannot unlink each other's fresh lock. If the claimed file is not the one judged
-// stale (a fresh lock was taken in between), it is linked back unless a newer lock already exists.
-// Residual: a fresh holder displaced and not restorable (a third writer re-locked in between) runs
-// concurrently with that writer once; this needs three-way interleaving with a stale lock present.
-async function breakStaleOutboxLock(lockFile, observed) {
-  const claimed = `${lockFile}.stale-${crypto.randomUUID()}`;
+async function readLockContent(lockFile) {
   try {
-    await fs.rename(lockFile, claimed);
+    return await fs.readFile(lockFile, "utf8");
   } catch (error) {
-    if (error?.code === "ENOENT") return;
+    if (error?.code === "ENOENT") return undefined;
     throw error;
   }
-  const content = await fs.readFile(claimed, "utf8").catch(() => undefined);
-  if (content !== observed) {
-    await fs.link(claimed, lockFile).catch((error) => {
-      if (error?.code !== "EEXIST") throw error;
-    });
-  }
-  await fs.unlink(claimed).catch(() => {});
 }
 
-async function acquireOutboxLock(lockFile, token) {
-  const handle = await fs.open(lockFile, "wx", 0o600);
+async function createLockFile(lockFile, content) {
+  const tmp = `${lockFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tmp, content, { mode: 0o600 });
   try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
-  } catch (error) {
-    await handle.close().catch(() => {});
-    await fs.unlink(lockFile).catch(() => {});
-    throw error;
+    await fs.link(tmp, lockFile);
+  } finally {
+    await fs.unlink(tmp).catch(() => {});
   }
-  await handle.close();
+}
+
+// Staleness is a property of the observed lock (dead holder pid, or held implausibly long), never of
+// how long a waiter has waited: a live holder paused under memory pressure keeps its lock.
+async function acquireLockFile(lockFile, token, breakStale) {
+  const content = JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() });
+  let delayMs = 2;
+  for (;;) {
+    try {
+      await createLockFile(lockFile, content);
+      return;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const observed = await readLockContent(lockFile);
+    if (observed === undefined) continue;
+    let ageMs;
+    try {
+      ageMs = Date.now() - (await fs.stat(lockFile)).mtimeMs;
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (lockPidAlive(lockHolder(observed)?.pid) === false || ageMs > OUTBOX_LOCK_LIVE_STALE_MS) {
+      await breakStale(observed);
+      continue;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    delayMs = Math.min(delayMs * 2, 50);
+  }
+}
+
+async function removeLockIf(lockFile, predicate) {
+  const current = await readLockContent(lockFile);
+  if (current !== undefined && predicate(current)) {
+    await fs.unlink(lockFile).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+// Serializes lock removal. Its own stale break is unserialized (residual: a break lock held by a
+// crashed process, or by one paused >30 s inside a removal of a few microseconds, can be removed
+// concurrently by two breakers; this needs that crash plus a three-way race).
+async function withOutboxBreakLock(lockFile, fn) {
+  const breakFile = `${lockFile}.break`;
+  const token = crypto.randomUUID();
+  await acquireLockFile(breakFile, token, (observed) => removeLockIf(breakFile, (current) => current === observed));
+  try {
+    return await fn();
+  } finally {
+    await removeLockIf(breakFile, (current) => lockHolder(current)?.token === token);
+  }
 }
 
 async function withOutboxLock(pendingFile, fn) {
   const lockFile = `${pendingFile}.lock`;
   await ensureParent(lockFile);
   const token = crypto.randomUUID();
-  let delayMs = 2;
-  for (;;) {
-    try {
-      await acquireOutboxLock(lockFile, token);
-      break;
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-    }
-    let observed;
-    let ageMs;
-    try {
-      observed = await fs.readFile(lockFile, "utf8");
-      ageMs = Date.now() - (await fs.stat(lockFile)).mtimeMs;
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
-      throw error;
-    }
-    // Staleness is a property of the lock (dead holder, unreadable, or held implausibly long), never
-    // of how long this waiter has waited: a live holder paused under memory pressure keeps its lock.
-    const alive = await outboxLockHolderAlive(lockFile);
-    const stale = alive === false || (alive === null && ageMs > OUTBOX_LOCK_UNREADABLE_STALE_MS) || ageMs > OUTBOX_LOCK_LIVE_STALE_MS;
-    if (stale) {
-      await breakStaleOutboxLock(lockFile, observed);
-      continue;
-    }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    delayMs = Math.min(delayMs * 2, 50);
-  }
+  await acquireLockFile(lockFile, token, (observed) => withOutboxBreakLock(lockFile, () => removeLockIf(lockFile, (current) => current === observed)));
   try {
     return await fn();
   } finally {
-    const current = await fs.readFile(lockFile, "utf8").catch(() => undefined);
-    let holder;
-    try { holder = JSON.parse(current ?? "null"); } catch { holder = null; }
-    if (holder?.token === token) await fs.unlink(lockFile).catch(() => {});
+    await withOutboxBreakLock(lockFile, () => removeLockIf(lockFile, (current) => lockHolder(current)?.token === token));
   }
 }
 

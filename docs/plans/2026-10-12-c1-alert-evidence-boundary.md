@@ -42,13 +42,16 @@ valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are cl
   predecessor head (`through_seq`/`through_hash`) must be cited by the first kept record, and the
   header (carried witness, coverage, projection digest) is returned. The whole-file content digest in
   the state file still binds the unverified prefix, header included.
-- `0936f47`, `5b09bf9` — **outbox lock contract:** one lock file `<pendingFile>.lock`, created with
-  `wx`, JSON `{pid, token, at}`; every outbox read-modify-write (queue, settle, view, attempt
+- `0936f47`, `5b09bf9`, and the round-5 lock rewrite — **outbox lock contract:** one lock file
+  `<pendingFile>.lock`, JSON `{pid, token, at}`, created complete (temp file + `link()`, which fails
+  if a lock exists — never empty); every outbox read-modify-write (queue, settle, view, attempt
   bookkeeping, corruption recovery) runs under it; recovery re-reads under the lock before
-  quarantining; release unlinks only the holder's own token. A lock is stale when its holder pid is
-  dead, it is unreadable for >2 s, or it is older than 30 s (never because a waiter waited); a stale
-  lock is broken by claiming it with a rename, restoring a displaced fresh lock. `alerts list`/`digest`
-  mark seen only the notice ids they rendered.
+  quarantining. A lock is stale when the holder pid in the *observed* content is dead or the lock is
+  older than 30 s (never because a waiter waited). Every lock removal — a holder's release (own
+  token) or a stale break (exact observed content) — runs under a second `<lockFile>.break` lock and
+  re-reads first, so nobody removes a lock other than the one they checked. Residual: the break lock's
+  own stale break is unserialized (needs a crashed/30 s-paused break-lock holder plus a three-way
+  race). `alerts list`/`digest` mark seen only the notice ids they rendered.
 
 The lock is **cooperative**: a same-UID writer that ignores it can still race or rewrite the outbox.
 That is the same deliberate same-UID forgery already out of scope above, not a new boundary.

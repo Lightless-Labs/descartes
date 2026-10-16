@@ -685,3 +685,22 @@ test("viewing with ids marks only the rendered notices seen", async () => {
   assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:queued-after-render"]);
   assert.deepEqual(state.seen.map((entry) => entry.id), ["notice:rendered"]);
 });
+
+test("outbox lock stress: heavy concurrent queues and views never lose or duplicate a notice", async () => {
+  for (let round = 0; round < 5; round += 1) {
+    const paths = await tempPaths();
+    const ids = Array.from({ length: 48 }, (_, index) => `notice:stress:${round}:${index}`);
+    const viewedIds = [];
+    await Promise.all([
+      ...ids.map((id) => queuePendingNotification(paths, { notify: true, title: id, body: "Body" }, { now: "2026-05-29T00:15:00.000Z", requiredNoticeId: id, ruleId: "integrity.test" })),
+      ...Array.from({ length: 6 }, () => viewPendingNotifications(paths, { now: "2026-05-29T00:16:00.000Z" }).then((viewed) => viewedIds.push(...viewed.map((entry) => entry.id)))),
+    ]);
+    const state = await readPendingNotifications(paths);
+    const all = [...state.pending.map((entry) => entry.id), ...state.seen.map((entry) => entry.id)];
+    assert.equal(state.tamper, undefined);
+    assert.deepEqual([...all].sort(), [...ids].sort(), `round ${round}: every notice is pending or seen exactly once`);
+    assert.deepEqual([...viewedIds].sort(), state.seen.map((entry) => entry.id).sort());
+    const names = await fs.readdir(path.join(paths.stateDir, "alerts"));
+    assert.equal(names.some((name) => name.includes(".lock") || name.includes(".tmp")), false, names.join(","));
+  }
+});
