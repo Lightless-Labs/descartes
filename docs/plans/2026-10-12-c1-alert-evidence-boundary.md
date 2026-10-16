@@ -57,29 +57,31 @@ valid concurrently written outbox; MEDIUM: `seen.resolution` unvalidated) are cl
   round 6: a paused breaker could otherwise make a live releaser time out and orphan its lock). Residual: the break lock's
   own dead-holder break is unserialized (needs a crashed break-lock holder plus a three-way race); and
   the pid-reuse probe compares wall-clock times, so a clock stepped forward by more than the 5 s slack
-  while a lock is already >30 s old could misjudge a live holder as reused. `alerts list`/`digest` mark seen only the notice ids they rendered.
+  while a lock is already >30 s old could misjudge a live holder as reused. Historical viewing-state
+  behavior is superseded by the retained-notice addendum below; list/digest never mark notices seen.
 
 The lock is **cooperative**: a same-UID writer that ignores it can still race or rewrite the outbox.
 That is the same deliberate same-UID forgery already out of scope above, not a new boundary.
 
-## Addendum: single-writer notification outbox (2026-10-16)
+## Addendum: retained required notices and outbox read errors (2026-10-16)
 
-The cooperative outbox lock is superseded and removed. The daemon is now the only process that
-writes `notification-pending.json`: queueing, delivery attempts/results, resolution, corruption
-recovery, and compaction all happen on the daemon tick. CLI list/digest rendering reads the outbox
-without mutation. A corrupt or malformed outbox is reported in memory by the CLI and left in place;
-the daemon quarantines and replaces it.
+The notification outbox is daemon-owned and stores retained required notices with their delivery
+outcome. There is no viewing/seen log, cursor, fold, rotation, archive, or resolution transition
+driven by `alerts list` or `alerts digest`. Those commands are read-only: they always render the
+newest required notices (up to 50 from the last 30 days) and an aggregate count of older or
+overflowed notices. Only daemon retention removes notices by time and count.
 
-CLI seen marks use `notification-seen.jsonl`. Each mark is a validated, bounded JSON line appended
-with one `O_APPEND` write, so concurrent CLI processes never share an outbox read-modify-write.
-The daemon folds marks by notice id, persists the outbox, records consumed offsets, and rotates the
-consumed generation. Replay after a crash between the fold and rotation is harmless because notice
-ids are idempotent; rotated generations are retained for safe late-writer recovery. Malformed seen
-lines are ignored and counted without blocking valid marks.
+`disabled` and `unavailable` outcomes are not delivered; the notice remains due and follows the
+existing exponential retry backoff. Discontinuity notice IDs include the journal family and epoch,
+so a later epoch cannot collide with an earlier notice. Outbox filesystem read failures other than
+`ENOENT` are not corruption: the daemon aborts that tick's outbox work, leaves the file untouched,
+and records an integrity warning in the tick summary/status. Proven parse/schema corruption is the
+only quarantine path; recovery salvages every valid notice embedded in the corrupt file into the
+fresh outbox before adding the integrity notice.
 
-The lock, stale-break, pid-reuse probe, bounded lock wait, and their tests are removed. The
-malformed-entry validation, compaction verification, `seen.resolution` validation, ISO overflow
-timestamp normalization, and discontinuity-notice warning remain covered.
+The focused regressions cover read-only viewing, delivery-independent retention, epoch-specific
+discontinuity identity, unreadable outboxes with no mutation, and malformed JSON quarantine with
+salvage.
 
 ## Atomic slices
 

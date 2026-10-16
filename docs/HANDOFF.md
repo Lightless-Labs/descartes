@@ -2,22 +2,27 @@
 
 **Last updated:** 2026-10-16
 
-## C1 notification outbox single-writer replacement — 2026-10-16 — local, not pushed
+## C1 retained required-notice semantics — 2026-10-16 — local, not pushed
 
-Removed the recurring notification-outbox lock blocker from `feat/c1-alert-foundations-2026-10`
-with two atomic commits: `d3bfb28` (TDD regressions and removal of lock-specific tests) and
-`8063af0` (implementation). The daemon is now the only outbox writer. CLI list/digest rendering
-reads the outbox without mutation; seen notices append validated, bounded JSONL records to
-`notification-seen.jsonl` with `O_APPEND`, and the daemon folds them by notice id, checkpoints the
-consumed offset, and rotates the consumed generation. Corrupt outboxes remain untouched by CLI and
-are quarantined/recovered only by the daemon. Malformed seen lines are ignored and counted.
+Replaced the viewing/seen mechanism with a daemon-owned retained notice collection. Required
+delivery outcomes stay attached to each notice; disabled/unavailable outcomes remain due with
+backoff. `alerts list` and `alerts digest` render a read-only newest-50/30-day window plus an
+older/overflow count, and never write notice state. Daemon-only retention removes notices by time
+and count. Discontinuity notice IDs now include the journal epoch.
 
-Focused verification: notification delivery **36/36**, alerts + digest + pending journal **60/60**,
-daemon **192/192**. Full fresh-XDG `npm test`: **2,812 tests: 2,749 pass, 22 fail, 35 skipped,
-6 todo** in 471.5 seconds. The 22 failures are environment-only: 17 notifier-reuse and 3
-tap-bump loopback test-server cases fail with sandbox `listen EPERM`, and 2 live macOS provenance
-checks return `unknown` under restricted process introspection. No changed-area product test failed.
-No push or merge.
+Outbox reads distinguish filesystem errors from parse/schema corruption. EACCES/EIO/EISDIR-style
+errors abort outbox work without mutation and appear as an integrity warning in tick status.
+Malformed JSON/schema is quarantined only by the daemon, with valid embedded notices salvaged into
+the fresh outbox.
+
+TDD commits are `65de1fb` (red tests), `22dcbe1` (implementation), and `946354d` (status-shape
+regression contract). Focused verification passes **106/106** across notification delivery,
+alerts, digest, pending journal, and C1 daemon integration; the affected daemon/fact-store status
+suite passes **207/207**. Full fresh-XDG `npm test` ran with **2,813 tests: 2,748 pass, 24 fail,
+35 skipped, 6 todo**. Two failures were the intentional `notification_outbox` status-shape
+contract and are fixed by `946354d`; the remaining 22 are environment-only: 17 notifier-reuse
+and 3 tap-bump loopback tests fail with sandbox `listen EPERM`, and 2 live-process provenance
+checks return `unknown` under restricted process introspection. No push or merge.
 
 ## C1 daybreak gate 3–6 follow-ups — 2026-10-16 — historical lock notes, superseded locally
 
@@ -26,7 +31,8 @@ Gate 3 (1 BLOCKER, 1 MEDIUM) and gate 4 (1 BLOCKER, 1 MEDIUM) closed on
 fresh outbox; list/JSON/digest render only well-formed notices), `7905d16` (incremental transition
 verification survives compaction via the cut header's recorded predecessor head), `0936f47` +
 `5b09bf9` (cooperative outbox lock around every read-modify-write; recovery re-reads under the lock;
-serialized, content-verified lock removal; list/digest mark seen only rendered ids; round 5 found a
+serialized, content-verified lock removal; historical list/digest viewing-state behavior is
+superseded by the retained-notice semantics above; round 5 found a
 lost-update in the first stale-break design, fixed by the lock rewrite; the re-run found the 30 s
 lease preempting a live paused holder — live holders are now never broken, pid reuse is detected via
 `ps`, and blocked waiters fail loudly after 120 s; round 6 found release waiting on the break lock
@@ -50,7 +56,7 @@ overflow severity), `d641b83` (incremental transition verification and chain-sou
 attribution), and `5ff8931` (daemon label/delivery closure witness authorization and visible retry
 failures). Same-UID writes remain `unprotected_same_uid`; they are now detected, hash-chained, and
 surfaced rather than treated as authoritative. Notifications remain optional: disabled/unavailable
-required notices stay pending until delivery or operator viewing.
+required notices stay pending until delivery; viewing never changes notice state.
 
 Focused C1 verification passes **all changed-area tests: 26/26** in the final daemon/label run; the
 earlier slices also passed their focused suites (transitions 18/18, labels 18/18, pending journal

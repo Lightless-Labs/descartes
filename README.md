@@ -346,6 +346,18 @@ wall-clock expiry. Residual: under cap pressure after a clock rollback, a rollba
 may be considered oldest by filename. The audit reader merges legacy files, archives, and dated
 segments by record timestamp in stable chronological order.
 
+Required notices (label application, discontinuity, unattributed change, integrity, label bursts,
+and outbox overflow) have separate delivery semantics. The daemon records the delivery outcome on
+the notice itself; `disabled` and `unavailable` are not delivery and remain due for the existing
+exponential retry backoff. Delivery does not make a notice disappear. `descartes alerts list` and
+`descartes alerts digest` are read-only and always show the newest required notices in a bounded
+window (up to 50 notices from the last 30 days), plus a count of older or overflowed notices.
+Nothing is consumed or marked by viewing. Only the daemon ages notices out by the time and count
+retention bounds. Discontinuity notice IDs include their journal family and epoch, so a new epoch
+cannot collide with an older one. A filesystem read failure while opening the outbox is an
+integrity warning and leaves the file untouched; only parse/schema corruption is quarantined, with
+valid embedded notices salvaged into the replacement outbox.
+
 The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
 diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
 is:
