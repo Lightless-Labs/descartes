@@ -1191,6 +1191,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let notificationOutbox;
   let notificationOutboxCanDrain = false;
   const notificationRouteBreakers = new Set();
+  let initialStatusWriteFailed = false;
   try {
     const recovered = await recoverNotificationOutbox(descartesPaths);
     if (recovered.outbox_error) {
@@ -2183,6 +2184,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       state: "error",
       storage_write_error: combineErrors(statusRecord.storage_write_error, message),
     };
+    initialStatusWriteFailed = true;
   }
   // Regression fix (sol re-review of the 7.2 re-phasing): computing the detector candidates
   // MUTATES detector stores (baseline folds, credential/lineage advances), so it must NOT run
@@ -2689,12 +2691,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       state: notificationOutbox.status === "warning" ? "error" : status.state,
       notification_outbox: notificationOutbox,
     };
-    try {
-      status = await persistStatus(descartesPaths, finalStatus);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[daemon] final notification outbox status write failed this tick (${message})`);
-      status = { ...finalStatus, state: "error", storage_write_error: combineErrors(finalStatus.storage_write_error, message) };
+    if (initialStatusWriteFailed) {
+      // Preserve the first write failure verbatim. Retrying a known-failing seam here would turn
+      // one honest error into duplicated storage_write_error text and would not create durable state.
+      status = { ...status, notification_outbox: notificationOutbox };
+    } else {
+      try {
+        status = await persistStatus(descartesPaths, finalStatus);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[daemon] final notification outbox status write failed this tick (${message})`);
+        status = { ...finalStatus, state: "error", storage_write_error: combineErrors(finalStatus.storage_write_error, message) };
+      }
     }
   }
   let pendingJournal;
