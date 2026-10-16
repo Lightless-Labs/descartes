@@ -16,7 +16,7 @@ lease preempting a live paused holder — live holders are now never broken, pid
 (fixed: release never waits) and a silently unqueued discontinuity notice (fixed: warned + carried
 into the tick summary) — those two fixes are NOT yet re-gated). Lock contract and its same-UID
 scoping: addendum in `docs/plans/2026-10-12-c1-alert-evidence-boundary.md`. Fresh-XDG full
-`npm test`: **2,818 tests: 2,777 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 6
+`npm test`: **2,820 tests: 2,779 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** daybreak gate 7 confirmation of `1af5828` + `07005d4` (gate-round budget for this cycle was exhausted at round 6)
 confirmation, then merge to local main, then C1a. No push.
 
 ## C1 alert evidence-boundary rework — 2026-10-12 — local, not pushed
