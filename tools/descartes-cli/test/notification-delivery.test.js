@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,14 +6,14 @@ import test from "node:test";
 import {
   defaultNotificationChannel,
   deliverNotificationDecision,
-  appendSeenNotification,
-  foldNotificationSeenLog,
   normalizeNotificationPayload,
   queuePendingNotification,
   notificationDeliveryResolution,
   readNotificationDeliveryAudit,
   readPendingNotifications,
   recoverNotificationOutbox,
+  retainNotificationOutbox,
+  selectNotificationNoticeWindow,
   readNotificationDeliveryConfig,
   resolveNotificationDeliveryPaths,
   testNotificationDelivery,
@@ -77,7 +76,7 @@ test("disabled delivery records a local audit without invoking adapters", async 
   assert.equal((await readNotificationDeliveryAudit(paths)).length, 1);
 });
 
-test("required_disabled_notice_stays_pending_until_cli_view", async () => {
+test("required_disabled_notice_stays_pending_until a later daemon retry", async () => {
   const paths = await tempPaths();
   const record = await deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
     now: "2026-05-29T00:01:00.000Z",
@@ -87,11 +86,9 @@ test("required_disabled_notice_stays_pending_until_cli_view", async () => {
   });
   assert.equal(record.status, "disabled");
   assert.equal((await readPendingNotifications(paths)).pending.length, 1);
-  await appendSeenNotification(paths, "unattributed:abc", { now: "2026-05-29T00:02:00.000Z" });
-  const folded = await foldNotificationSeenLog(paths, { now: "2026-05-29T00:02:00.000Z" });
-  assert.equal(folded.seen, 1);
-  assert.equal((await readPendingNotifications(paths)).pending.length, 0);
-  assert.equal((await readPendingNotifications(paths)).seen[0].id, "unattributed:abc");
+  const state = await readPendingNotifications(paths);
+  assert.equal(state.notices.length, 1);
+  assert.equal(state.notices[0].last_status, "disabled");
 });
 
 test("required_unavailable_notice_stays_pending", async () => {
@@ -184,32 +181,26 @@ function validEntry(overrides = {}) {
 }
 
 test("malformed notification entries are reported read-only and quarantined only by daemon recovery", async () => {
-  const seenEntry = validEntry({ seen_at: "2026-05-29T00:01:00.000Z", resolution: "viewed" });
-  const resolvedEntry = validEntry({ resolved_at: "2026-05-29T00:01:00.000Z", resolution: "delivered" });
   const cases = [
-    { pending: [null], seen: [], resolved: [] },
-    { pending: [validEntry(), 7], seen: [], resolved: [] },
-    { pending: [validEntry({ title: undefined })], seen: [], resolved: [] },
-    { pending: [validEntry({ attempts: -1 })], seen: [], resolved: [] },
-    { pending: [], seen: [null], resolved: [] },
-    { pending: [], seen: [validEntry()], resolved: [] },
-    { pending: [], seen: [seenEntry], resolved: [{ ...resolvedEntry, resolution: undefined }] },
-    { pending: [], seen: [], resolved: [validEntry()] },
+    { notices: [null] },
+    { notices: [validEntry(), 7] },
+    { notices: [validEntry({ title: undefined })] },
+    { notices: [validEntry({ attempts: -1 })] },
   ];
   for (const [index, body] of cases.entries()) {
     const paths = await tempPaths();
     const { pendingFile } = resolveNotificationDeliveryPaths(paths);
     await fs.mkdir(path.dirname(pendingFile), { recursive: true });
-    await fs.writeFile(pendingFile, JSON.stringify({ v: 1, ...body }));
+    await fs.writeFile(pendingFile, JSON.stringify({ v: 2, ...body }));
 
     const state = await readPendingNotifications(paths);
     assert.equal(state.tamper?.kind, "notification_outbox_corrupt", `case ${index}`);
-    assert.equal(state.pending.length, 1, `case ${index}`);
-    assert.equal(state.pending[0].rule_id, "integrity.notification_outbox", `case ${index}`);
+    assert.equal(state.notices.length, 1, `case ${index}`);
+    assert.equal(state.notices[0].rule_id, "integrity.notification_outbox", `case ${index}`);
     assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false, `case ${index}: CLI/read path must not quarantine`);
     await recoverNotificationOutbox(paths);
     const persisted = JSON.parse(await fs.readFile(pendingFile, "utf8"));
-    assert.equal(persisted.pending.length, 1, `case ${index}: daemon recovery replaces the corrupt outbox`);
+    assert.equal(persisted.notices.length, 1, `case ${index}: daemon recovery replaces the corrupt outbox`);
     assert.equal((await readPendingNotifications(paths)).tamper, undefined, `case ${index}: the recovered outbox reads clean`);
     assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), `case ${index}`);
   }
@@ -219,7 +210,7 @@ test("daemon queueing still works after a structurally malformed outbox", async 
   const paths = await tempPaths();
   const { pendingFile } = resolveNotificationDeliveryPaths(paths);
   await fs.mkdir(path.dirname(pendingFile), { recursive: true });
-  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null], seen: [], resolved: [] }));
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 2, notices: [null] }));
   await recoverNotificationOutbox(paths);
   const record = await deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
     now: "2026-05-29T00:05:00.000Z",
@@ -230,8 +221,8 @@ test("daemon queueing still works after a structurally malformed outbox", async 
   assert.equal(record.status, "disabled");
   const state = await readPendingNotifications(paths);
   assert.equal(state.tamper, undefined);
-  assert.deepEqual(state.pending.map((entry) => entry.id).sort(), ["integrity.notification_outbox:corrupt", "notice:after-malformed"]);
-  assert.equal(state.pending.find((entry) => entry.id === "notice:after-malformed").attempts, 1);
+  assert.deepEqual(state.notices.map((entry) => entry.id).sort(), ["integrity.notification_outbox:corrupt", "notice:after-malformed"]);
+  assert.equal(state.notices.find((entry) => entry.id === "notice:after-malformed").attempts, 1);
 });
 
 test("every outbox entry the module writes passes its own shape validation", async () => {
@@ -241,22 +232,19 @@ test("every outbox entry the module writes passes its own shape validation", asy
   await deliverNotificationDecision(paths, { notify: true, title: "Failing", body: "Body" }, options("notice:failing", {
     config: { enabled: true, channel: "macos-native" }, platform: "darwin", nativeHelperBaseDir: paths.cacheDir,
   }));
-  // delivered settles into resolved
+  // delivered remains retained with its delivery outcome
   await deliverNotificationDecision(paths, { notify: true, title: "Delivered", body: "Body" }, options("notice:delivered", {
     config: { enabled: true, channel: "syslog" }, platform: "linux", runner: async () => ({ stdout: "", stderr: "" }),
   }));
   // a numeric rule id and a Date `now` are normalized, never self-corrupting
   await queuePendingNotification(paths, { notify: true, title: "Odd inputs", body: "Body" }, { now: new Date("2026-05-29T00:07:00.000Z"), requiredNoticeId: "notice:odd", ruleId: 42 });
-  await appendSeenNotification(paths, "notice:failing", { now: "2026-05-29T00:08:00.000Z" });
-  await appendSeenNotification(paths, "notice:odd", { now: "2026-05-29T00:08:00.000Z" });
-  await foldNotificationSeenLog(paths, { now: "2026-05-29T00:08:00.000Z" });
   await queuePendingNotification(paths, { notify: true, title: "Still pending", body: "Body" }, options("notice:pending"));
   const state = await readPendingNotifications(paths);
   assert.equal(state.tamper, undefined);
-  assert.ok(state.resolved.some((entry) => entry.id === "notice:delivered"));
-  assert.ok(state.seen.some((entry) => entry.id === "notice:failing" && entry.attempts === 1));
-  assert.ok(state.seen.some((entry) => entry.id === "notice:odd" && entry.rule_id === "42"));
-  assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:pending"]);
+  assert.ok(state.notices.some((entry) => entry.id === "notice:delivered" && entry.last_status === "delivered"));
+  assert.ok(state.notices.some((entry) => entry.id === "notice:failing" && entry.attempts === 1));
+  assert.ok(state.notices.some((entry) => entry.id === "notice:odd" && entry.rule_id === "42"));
+  assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:failing", "notice:odd", "notice:pending"]);
 });
 
 test("repeated identical delivery failures append one immutable audit row per attempt", async () => {
@@ -602,11 +590,10 @@ test("retention never deletes the segment written by the current process tick", 
   await fs.access(rollbackNamed);
 });
 
-test("seen and resolved entries must carry a well-formed resolution", async () => {
+test("the old viewed/resolved outbox schema is corrupt and never drives a view mutation", async () => {
   for (const body of [
-    { pending: [], seen: [validEntry({ seen_at: "2026-05-29T00:01:00.000Z", resolution: { odd: true } })], resolved: [] },
-    { pending: [], seen: [validEntry({ seen_at: "2026-05-29T00:01:00.000Z" })], resolved: [] },
-    { pending: [], seen: [], resolved: [validEntry({ resolved_at: "2026-05-29T00:01:00.000Z", resolution: 7 })] },
+    { pending: [], seen: [validEntry()], resolved: [] },
+    { pending: [], seen: [], resolved: [validEntry()] },
   ]) {
     const paths = await tempPaths();
     const { pendingFile } = resolveNotificationDeliveryPaths(paths);
@@ -616,6 +603,7 @@ test("seen and resolved entries must carry a well-formed resolution", async () =
   }
 });
 
+/* removed: viewing must never mutate notification state
 test("seen marks append to the CLI log and the daemon folds only rendered notices", async () => {
   const paths = await tempPaths();
   for (const id of ["notice:rendered", "notice:queued-after-render"]) {
@@ -628,7 +616,9 @@ test("seen marks append to the CLI log and the daemon folds only rendered notice
   assert.deepEqual(state.pending.map((entry) => entry.id), ["notice:queued-after-render"]);
   assert.deepEqual(state.seen.map((entry) => entry.id), ["notice:rendered"]);
 });
+*/
 
+/* removed with viewing marks
 test("48 CLI seen append processes plus a daemon fold lose neither notices nor seen marks", async () => {
   const paths = await tempPaths();
   const ids = Array.from({ length: 48 }, (_, index) => `notice:process:${index}`);
@@ -644,7 +634,9 @@ test("48 CLI seen append processes plus a daemon fold lose neither notices nor s
   assert.deepEqual(state.pending, []);
   assert.deepEqual(state.seen.map((entry) => entry.id).sort(), ids.sort());
 });
+*/
 
+/* removed with viewing marks
 test("a crash after fold and offset record replays seen marks idempotently", async () => {
   const paths = await tempPaths();
   await queuePendingNotification(paths, { notify: true, title: "Replay", body: "Body" }, { now: "2026-05-29T00:18:00.000Z", requiredNoticeId: "notice:replay", ruleId: "integrity.test" });
@@ -654,7 +646,9 @@ test("a crash after fold and offset record replays seen marks idempotently", asy
   assert.equal(replay.seen, 0, "the replay is idempotent after the outbox was already persisted");
   assert.deepEqual((await readPendingNotifications(paths)).seen.map((entry) => entry.id), ["notice:replay"]);
 });
+*/
 
+/* removed with viewing marks
 test("malformed seen-log lines are ignored and counted without blocking later valid marks", async () => {
   const paths = await tempPaths();
   await queuePendingNotification(paths, { notify: true, title: "Valid", body: "Body" }, { now: "2026-05-29T00:21:00.000Z", requiredNoticeId: "notice:valid-seen", ruleId: "integrity.test" });
@@ -665,6 +659,7 @@ test("malformed seen-log lines are ignored and counted without blocking later va
   assert.equal(folded.malformed, 1);
   assert.deepEqual((await readPendingNotifications(paths)).seen.map((entry) => entry.id), ["notice:valid-seen"]);
 });
+*/
 
 test("an overflow summary created with a non-ISO now still passes outbox validation", async () => {
   const paths = await tempPaths();
@@ -674,4 +669,49 @@ test("an overflow summary created with a non-ISO now still passes outbox validat
   const state = await readPendingNotifications(paths);
   assert.equal(state.tamper, undefined);
   assert.ok(state.pending.some((entry) => entry.rule_id === "integrity.notification_outbox" && entry.first_seen_at === "1970-01-01T00:00:00.000Z"));
+});
+
+test("non-ENOENT outbox read errors abort outbox work without quarantine or mutation", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(pendingFile, { recursive: true });
+  const before = await fs.readdir(path.dirname(pendingFile));
+  const recovered = await recoverNotificationOutbox(paths);
+  assert.equal(recovered.outbox_error.code, "EISDIR");
+  assert.equal(recovered.recovered, undefined);
+  assert.deepEqual(await fs.readdir(path.dirname(pendingFile)), before);
+  await assert.rejects(() => queuePendingNotification(paths, { notify: true, title: "No write", body: "Body" }, {
+    now: "2026-05-29T00:30:00.000Z", required: true, requiredNoticeId: "notice:eisdir", ruleId: "integrity.test",
+  }), /EISDIR/);
+  assert.deepEqual(await fs.readdir(path.dirname(pendingFile)), before);
+});
+
+test("malformed JSON is quarantined and valid embedded notices are salvaged", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  const entry = validEntry({ id: "notice:salvage" });
+  await fs.writeFile(pendingFile, `{"v":2,"notices":[${JSON.stringify(entry)},`);
+  const recovered = await recoverNotificationOutbox(paths);
+  assert.equal(recovered.recovered, true);
+  assert.ok(recovered.notices.some((notice) => notice.id === "notice:salvage"));
+  assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")));
+  const persisted = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+  assert.ok(persisted.notices.some((notice) => notice.id === "notice:salvage"));
+});
+
+test("daemon retention keeps the newest 50 notices in the 30-day window and aggregates older notices", async () => {
+  const paths = await tempPaths();
+  for (let index = 0; index < 55; index += 1) {
+    await queuePendingNotification(paths, { notify: true, title: `N ${index}`, body: "Body" }, {
+      now: new Date(Date.UTC(2026, 0, 1) + index * 60 * 60 * 1000).toISOString(), required: true, requiredNoticeId: `notice:retention:${index}`, ruleId: "integrity.test",
+    });
+  }
+  const retained = await retainNotificationOutbox(paths, { now: "2026-01-04T00:00:00.000Z" });
+  assert.equal(retained.status, "ok");
+  const state = await readPendingNotifications(paths);
+  const view = selectNotificationNoticeWindow(state, { now: "2026-01-04T00:00:00.000Z" });
+  assert.equal(view.entries.filter((notice) => notice.rule_id === "integrity.test").length, 50);
+  assert.equal(view.older_count, 5);
+  assert.ok(view.entries.some((notice) => notice.rule_id === "integrity.notification_outbox"));
 });

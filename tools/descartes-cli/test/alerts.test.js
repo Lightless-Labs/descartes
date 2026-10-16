@@ -83,7 +83,7 @@ test("alerts list renders present alerts and reports a malformed outbox without 
   const paths = await tempPaths();
   const pendingFile = path.join(paths.stateDir, "alerts", "notification-pending.json");
   await fs.mkdir(path.dirname(pendingFile), { recursive: true });
-  await fs.writeFile(pendingFile, JSON.stringify({ v: 1, pending: [null], seen: [], resolved: [] }));
+  await fs.writeFile(pendingFile, JSON.stringify({ v: 2, notices: [null] }));
 
   const outputs = [];
   await runAlerts(paths, ["list"], { output: (line) => outputs.push(line), now: "2026-05-29T00:00:00.000Z" });
@@ -94,9 +94,8 @@ test("alerts list renders present alerts and reports a malformed outbox without 
   assert.match(outputs[0], /Required notices pending: 1/);
   assert.equal((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")), false);
   const state = JSON.parse(await fs.readFile(pendingFile, "utf8"));
-  assert.equal(state.pending.length, 1, "the CLI never writes the corrupt outbox");
-  const seenLog = await fs.readFile(path.join(paths.stateDir, "alerts", "notification-seen.jsonl"), "utf8");
-  assert.match(seenLog, /notification_outbox:corrupt/);
+  assert.equal(state.notices.length, 1, "the CLI never writes the corrupt outbox");
+  await assert.rejects(fs.access(path.join(paths.stateDir, "alerts", "notification-seen.jsonl")));
 });
 
 test("alert list renderer skips odd pending notices and counts them without hiding alerts", () => {
