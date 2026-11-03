@@ -2,6 +2,28 @@
 
 **Last updated:** 2026-11-03
 
+## Linux ACL fallback re-gate closure — 2026-11-03 — local, not pushed
+
+Closed the daybreak blocker on `fix/linux-acl-fallback-2026-11` in atomic commits `b182a95`
+(red hermetic re-gate tests), `c232642` (collector and daemon implementation), and `a95278c`
+(top-level provenance retention for structural collectors). Every direct resolver-backed collector
+now retains `binary_provenance` on successful and timed failure results. The daemon samples the
+host Linux ACL capability once per fast tick, combines it with envelope evidence, and suppresses
+the signal on macOS. The real `ps` collector path is covered end-to-end for unverified Linux,
+verified Linux, and macOS, including the daemon status and `collector.binary_state` fact surfaces.
+
+The direct resolver-backed collector list is: `certificates.js`, `containers.js`, `disks.js`,
+`host-lifecycle.js`, `login-sessions.js`, `logs.js`, `net-config.js`, `network.js`, `processes.js`,
+`provenance.js`, `provenance-warnings.js`, `scheduled-jobs.js`, `services.js`,
+`session-attachment.js`, `sessions.js`, `system.js`, `tailscale-status.js`, `time-sync.js`,
+`vms.js`, and `vpn-peer-status.js`.
+
+The new ACL re-gate tests pass **4/4**. Final fresh-XDG full `npm test` reports **2,838 tests:
+2,775 pass, 22 fail, 0 cancelled, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump loopback cases fail with sandbox `listen EPERM`, and 2 live
+process provenance checks return `unknown` under restricted macOS process introspection. No push
+or merge.
+
 ## Linux ACL fallback rework — 2026-11-03 — local, not pushed
 
 On `fix/linux-acl-fallback-2026-11`, reworked the Linux ACL evidence ladder after daybreak review.
