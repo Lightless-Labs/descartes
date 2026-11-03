@@ -80,7 +80,7 @@ guessing, so it never fabricates a "first time seen" claim. Positive-evidence de
 benign or not. See [current limits](#current-limits).
 
 Collector execution refuses a path component when an untrusted principal could replace it, including through
-an unverified local group membership or ACL.
+an unverified local group membership, ACL presence, or unknown ACL state.
 
 The durable core will move to Rust over time. The current CLI uses Node.js, because this
 lets the tool ship quickly. The CLI includes the agent harness and the subscription login.
@@ -211,7 +211,10 @@ Collector subprocesses never use the ambient `PATH`: each bare binary name is re
 fixed, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
 the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
 and checks the file plus every ancestor directory to `/`. A normal component is trusted only when
-it is owned by `root` or the daemon UID, has no ACL, and has no group- or other-write bit. Linux
+it is owned by `root` or the daemon UID, has no group- or other-write bit, and either has verified
+ACL absence or carries visible `acl_evidence: "unverified"` provenance. On Linux, ACL checks first
+use a trusted absolute `getfattr`, then a trusted GNU coreutils `ls`; other `ls` implementations
+are never treated as ACL-free. Linux
 rejects every group-writable or other-writable component as `untrusted_binary` with reason
 `group_writable`; it does not consult account databases to establish group trust. macOS may accept
 a group-writable component only after complete local `dscl` resolution proves that every writer is
@@ -224,11 +227,14 @@ Same-UID owner writability is inside Descartes' current trust boundary and is re
 Shell wrappers are rejected unless
 explicitly operator-trusted, so a trusted wrapper can never authorize an untrusted downstream
 binary. The resolver records a SHA-256 content hash for each resolved binary as informational
-provenance only; it is not persisted and never gates trust. An offending component,
-ACL uncertainty, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
+provenance only; it is not persisted and never gates trust. An offending component, ACL presence or
+unknown ACL state, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
 recheck produces `untrusted_binary`; the collector does not execute it and the census remains
 incomplete. The recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU
 window.
+
+On Linux hosts with neither `getfattr` nor GNU coreutils `ls`, an administrator-set permissive ACL
+on a collector path is not detected (ownership and mode bits are still enforced).
 
 Accepted residual: a former member of any accepted component group can retain that group's GID in
 processes started before removal and could modify an accepted binary in place; multi-admin or

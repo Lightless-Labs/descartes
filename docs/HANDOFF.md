@@ -1,6 +1,22 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-16
+**Last updated:** 2026-11-03
+
+## Linux ACL fallback rework — 2026-11-03 — local, not pushed
+
+On `fix/linux-acl-fallback-2026-11`, reworked the Linux ACL evidence ladder after daybreak review.
+`3943cf3` adds red hermetic coverage; `2f5ef38` implements trusted absolute `getfattr`, trusted
+GNU-coreutils-only `ls --version` fallback, full helper mode/ownership-chain validation, per-tick
+ACL-tool caching, and explicit `acl_unverified` provenance/status/fact surfaces; `487e603` updates
+the collector-state record-size pin for the new schema field. Renamed BusyBox, Toybox, uutils, and
+untrusted/attacker-controlled `ls` paths never produce ACL absence. A host without a verifiable ACL
+tool still resolves mode/ownership-trusted collectors, but records `acl_evidence: "unverified"`.
+
+Focused ACL/C2/schema verification passes **87/87**. Final fresh-XDG full `npm test` reports
+**2,834 tests: 2,771 pass, 22 fail, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump loopback cases fail with sandbox `listen EPERM`, and 2 live
+process provenance checks return `unknown` under restricted macOS process introspection. No changed-
+area product test failed. No push or merge.
 
 ## Linux ACL fallback and hermetic binary resolver — 2026-11-03 — local, not pushed
 

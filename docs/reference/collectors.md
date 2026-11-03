@@ -16,8 +16,9 @@ daemon user's `~/.nix-profile/bin`, and `/etc/profiles/per-user/<user>/bin`), Ni
 locations, Homebrew locations on macOS, and the macOS `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
 CLI path. The resolver follows
 symlinks, requires a regular executable, and checks the file plus every ancestor directory to `/`:
-only root or the daemon UID may own each component; ACL presence or ACL detection failure is
-rejected. On Linux, any group-write or other-write is rejected as `untrusted_binary` with reason
+only root or the daemon UID may own each component; ACL presence is rejected, while an unavailable
+Linux ACL tool is recorded as `acl_evidence: "unverified"` and does not become false ACL absence.
+On Linux, any group-write or other-write is rejected as `untrusted_binary` with reason
 `group_writable`; Linux no longer consults account databases for group trust. On macOS, group-write
 is accepted only when complete local `dscl` resolution proves every writer is root, the daemon UID,
 or a local UID below 501 whose `AuthenticationAuthority` is absent or only `DisabledUser`.
@@ -28,11 +29,14 @@ reports `No such key: NestedGroups`; AppleMetaNodeLocation must be present and e
 Nested or non-local groups are rejected. Same-UID owner writability is
 accepted within the current trust boundary but recorded as provenance. The resolver records a
 SHA-256 content hash for each resolved binary as informational provenance only; it is not persisted
-and never gates trust. A failed check is `untrusted_binary`, is never executed, and leaves the
-source census incomplete. The immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate
+and never gates trust. An offending component, ACL presence or unknown ACL state, stat failure, or
+binary replacement is `untrusted_binary`, is never executed, and leaves the source census incomplete.
+The immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate
 the residual resolution-to-exec TOCTOU window. Accepted residual: a former member of any accepted
 component group can retain that group's GID in processes started before removal and could modify an
 accepted binary in place; multi-admin or directory-bound Macs fail closed.
+On Linux hosts with neither `getfattr` nor GNU coreutils `ls`, an administrator-set permissive ACL
+on a collector path is not detected (ownership and mode bits are still enforced).
 Operators may list explicit absolute escape-hatch paths in
 `watch.json` under `trusted_binary_paths`; those entries still need realpath + regular-file
 validation and are reported as `operator_trusted`. Evidence records the requested binary, resolved
