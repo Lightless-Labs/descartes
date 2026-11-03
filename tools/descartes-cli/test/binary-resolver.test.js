@@ -210,6 +210,7 @@ test("parseLinuxAclStatus recognizes real GNU ls mode fields", () => {
   assert.equal(parseLinuxAclStatus("-rwxr-xr-x+ 1 root root 123 Jan  1 00:00 /usr/bin/ps\n"), "present");
   assert.equal(parseLinuxAclStatus("-rwxr-xr-x. 1 root root 123 Jan  1 00:00 /usr/bin/ps\n"), "absent");
   assert.equal(parseLinuxAclStatus("not ls output\n"), "unknown");
+  assert.equal(parseLinuxAclStatus("-rwxr-xr-x 1 root root 123 Jan  1 00:00 /usr/bin/ps\nextra output\n"), "unknown");
 });
 
 test("Linux ACL probe falls back to resolved GNU ls when getfattr is unavailable", async () => {

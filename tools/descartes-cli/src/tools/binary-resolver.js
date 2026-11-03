@@ -14,6 +14,7 @@ const execFileAsyncDefault = promisify(execFile);
 const MACOS_LS = "/bin/ls";
 const MACOS_DSCL = "/usr/bin/dscl";
 const LINUX_XATTR_COMMANDS = ["/usr/bin/getfattr", "/bin/getfattr"];
+const LINUX_LS_COMMANDS = ["/bin/ls", "/usr/bin/ls"];
 const LINUX_ACL_ATTRIBUTES = ["system.posix_acl_access", "system.posix_acl_default"];
 
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
@@ -246,10 +247,10 @@ function onlyDisabledUserAuthorities(authorities) {
   return authorities.length === 0 || authorities.every((value) => /^(?:;DisabledUser;)(?:\s+;DisabledUser;)*$/.test(value.trim()));
 }
 
-async function execLookup(execFileAsync, command, args, signal) {
+async function execLookup(execFileAsync, command, args, signal, options = {}) {
   try {
     throwIfCollectorAborted(signal);
-    const result = await execFileAsync(command, args, { timeout: 5000, maxBuffer: 256 * 1024 });
+    const result = await execFileAsync(command, args, { timeout: 5000, maxBuffer: 256 * 1024, ...options });
     return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   } catch (error) {
     return { error };
@@ -400,7 +401,44 @@ export function parseMacOsAclStatus(stdout) {
     : "unknown";
 }
 
-export async function detectAclStatus(component, { platform, stat, execFileAsync = execFileAsyncDefault, signal } = {}) {
+export function parseLinuxAclStatus(stdout) {
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  const nonEmptyLines = lines.filter((candidate) => candidate.trim());
+  if (nonEmptyLines.length !== 1) return "unknown";
+  const line = nonEmptyLines[0];
+  const mode = line.trim().split(/\s+/)[0];
+  if (!/^[bcdlps-][rwxXsStT-]{9}[.+]?$/.test(mode)) return "unknown";
+  return mode[10] === "+" ? "present" : "absent";
+}
+
+async function detectLinuxAclWithLs(component, { execFileAsync, realpathFn, signal }) {
+  for (const command of LINUX_LS_COMMANDS) {
+    throwIfCollectorAborted(signal);
+    const real = await safeRealpath(realpathFn, command);
+    if (!real.path) {
+      if (missing(real.error)) continue;
+      return "unknown";
+    }
+    if (!path.isAbsolute(real.path) || path.basename(real.path) === "busybox") return "unknown";
+    const result = await execLookup(
+      execFileAsync,
+      real.path,
+      ["-ld", "--", component],
+      signal,
+      { env: { ...process.env, LC_ALL: "C" } },
+    );
+    return result.error ? "unknown" : parseLinuxAclStatus(result.stdout);
+  }
+  return "unknown";
+}
+
+export async function detectAclStatus(component, {
+  platform,
+  stat,
+  execFileAsync = execFileAsyncDefault,
+  realpathFn = defaultRealpath,
+  signal,
+} = {}) {
   if (platform === "darwin") {
     const result = await execLookup(execFileAsync, MACOS_LS, ["-led", component], signal);
     return result.error ? "unknown" : parseMacOsAclStatus(result.stdout);
@@ -409,6 +447,7 @@ export async function detectAclStatus(component, { platform, stat, execFileAsync
     const attributes = stat?.isDirectory?.()
       ? LINUX_ACL_ATTRIBUTES
       : [LINUX_ACL_ATTRIBUTES[0]];
+    let getfattrFound = false;
     for (const command of LINUX_XATTR_COMMANDS) {
       let commandUnavailable = true;
       for (const attribute of attributes) {
@@ -416,6 +455,7 @@ export async function detectAclStatus(component, { platform, stat, execFileAsync
         if (!result.error) return "present";
         if (result.error.code === "ENOENT") continue;
         commandUnavailable = false;
+        getfattrFound = true;
         // A missing attribute is the only trustworthy proof that no ACL is present. In
         // particular, getfattr's exit status 1 is ambiguous unless its stderr identifies the
         // requested attribute as absent; permission, unsupported-filesystem, and other errors
@@ -425,6 +465,7 @@ export async function detectAclStatus(component, { platform, stat, execFileAsync
       }
       if (!commandUnavailable) return "absent";
     }
+    if (!getfattrFound) return detectLinuxAclWithLs(component, { execFileAsync, realpathFn, signal });
   }
   return "unknown";
 }
@@ -438,6 +479,7 @@ async function inspectTrustedPath(resolvedPath, {
   groupWriterUidsFn = loadGroupWriterUids,
   groupWriterCache = {},
   aclCheckFn = detectAclStatus,
+  realpathFn = defaultRealpath,
   execFileAsync = execFileAsyncDefault,
   signal,
 } = {}) {
@@ -466,6 +508,11 @@ async function inspectTrustedPath(resolvedPath, {
   const components = [resolvedPath, ...ancestorPaths(resolvedPath)];
   const sameUidWritableComponents = [];
   const acceptedSystemAccounts = [];
+  const componentResults = [];
+
+  // Establish mode-bit, ownership, and group-writer trust for the complete component chain
+  // before probing any ACL. This makes the first offending component deterministic and avoids
+  // subprocesses for a path already rejected by local metadata.
   for (const component of components) {
     const result = component === resolvedPath ? fileResult : await safeStat(statFn, component);
     if (!result.stat) return trustFailure({ resolvedPath, component, reason: "stat_failed", sameUidWritableComponents, acceptedSystemAccounts });
@@ -508,12 +555,22 @@ async function inspectTrustedPath(resolvedPath, {
     if ((mode & 0o002) !== 0) {
       return trustFailure({ resolvedPath, component, reason: "group_writable", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
-    const aclStatus = normalizeAclStatus(await aclCheckFn(component, { platform, stat: result.stat, execFileAsync, signal }));
-    if (aclStatus !== "absent") {
-      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
-    }
+    componentResults.push({ component, stat: result.stat, writerUids });
     if ((mode & 0o200) !== 0 && ownerUid === expectedUid) {
       sameUidWritableComponents.push(component);
+    }
+  }
+
+  for (const { component, stat, writerUids } of componentResults) {
+    const aclStatus = normalizeAclStatus(await aclCheckFn(component, {
+      platform,
+      stat,
+      execFileAsync,
+      realpathFn,
+      signal,
+    }));
+    if (aclStatus !== "absent") {
+      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
   }
 
@@ -592,6 +649,7 @@ export async function resolveCollectorBinary(binary, {
       groupWriterCache,
       execFileAsync,
       aclCheckFn,
+      realpathFn,
       signal,
     });
     if (inspected.status === "resolved") {
