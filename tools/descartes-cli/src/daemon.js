@@ -109,8 +109,23 @@ import { collectHostLifecycleEvidence, readHostLifecycle } from "./tools/host-li
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
+import { getLinuxAclEvidenceCapability } from "./tools/binary-resolver.js";
 
 const execFileAsync = promisify(execFile);
+
+function hasUnverifiedAclEvidence(value, depth = 0) {
+  if (depth > 5 || value === null || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((item) => hasUnverifiedAclEvidence(item, depth + 1));
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "binary_provenance" && child?.acl_evidence === "unverified") return true;
+    if (hasUnverifiedAclEvidence(child, depth + 1)) return true;
+  }
+  return false;
+}
+
+function aclEvidenceStatus(envelope, platform = process.platform) {
+  return platform === "linux" && hasUnverifiedAclEvidence(envelope?.result) ? "unverified" : undefined;
+}
 
 export const DEFAULT_DAEMON_INTERVAL_MS = 60 * 1000;
 export const DEFAULT_DAEMON_PROCESS_LIMIT = 5;
@@ -450,6 +465,7 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
   const collectorOptions = {
     ...options,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    aclToolCache: options.aclToolCache ?? {},
   };
   const evidence = [];
   if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system(collectorOptions));
@@ -526,6 +542,7 @@ export async function collectStructuralCensusEvidence(structuralProfile = {}, co
   const collectorOptions = {
     ...options,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    aclToolCache: options.aclToolCache ?? {},
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(collectorOptions));
@@ -552,6 +569,7 @@ export async function collectStructuralContextEvidence(structuralProfile = {}, c
   const collectorOptions = {
     ...rest,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    aclToolCache: options.aclToolCache ?? {},
     killSignal: options.killSignal ?? "SIGKILL",
     lastHistoryCache: options.lastHistoryCache ?? {},
   };
@@ -587,7 +605,7 @@ export async function collectStructuralContextEvidence(structuralProfile = {}, c
 
 /** Full structural phases for direct callers; the daemon wraps only the incumbent phase in main's deadline race. */
 export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
-  const structuralOptions = { ...options, lastHistoryCache: options.lastHistoryCache ?? {} };
+  const structuralOptions = { ...options, lastHistoryCache: options.lastHistoryCache ?? {}, aclToolCache: options.aclToolCache ?? {} };
   const evidence = await collectStructuralCensusEvidence(structuralProfile, collectors, structuralOptions);
   return [...evidence, ...await collectStructuralContextEvidence(structuralProfile, collectors, structuralOptions)];
 }
@@ -1277,9 +1295,23 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  const collectorOptions = {
+  const resolverOptions = {
+    ...(options.resolverOptions ?? {}),
+    ...(options.platform ? { platform: options.platform } : {}),
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+    aclToolCache: options.aclToolCache ?? options.resolverOptions?.aclToolCache ?? {},
   };
+  const collectorOptions = resolverOptions;
+  const aclPlatform = options.platform ?? resolverOptions.platform ?? process.platform;
+  let hostAclEvidence;
+  try {
+    hostAclEvidence = await (options.aclEvidenceCapability ?? getLinuxAclEvidenceCapability)({
+      ...resolverOptions,
+      platform: aclPlatform,
+    });
+  } catch {
+    hostAclEvidence = aclPlatform === "linux" ? "unverified" : "not_applicable";
+  }
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
   // delete quarantines older than 31 days. Fact I/O only when a tier is on (no I/O when disabled).
@@ -1466,6 +1498,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             id: envelope.id,
             status: envelope.status,
             tool: envelope.trace?.tool,
+            ...(aclEvidenceStatus(envelope, aclPlatform) ? { acl_evidence: aclEvidenceStatus(envelope, aclPlatform) } : {}),
             ...(envelope.source === "daemon" && typeof envelope.result?.error === "string" ? { error: envelope.result.error } : {}),
           }));
 
@@ -1556,7 +1589,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             try {
               contextC2Prepared = await (options.prepareContextC2 ?? prepareContextC2)({
                 descartesPaths,
-                evidence: structuralEvidence,
+                evidence: [...evidence, ...structuralEvidence],
                 basePoints: factPoints,
                 hostFacts: hostContext?.facts,
                 loginDedupe,
@@ -2142,7 +2175,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure || notificationOutbox?.status === "warning" ? "error" : "ok",
     mode: options.mode ?? "foreground",
     profile,
-    collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),
+    collector_statuses: evidence.map((envelope) => ({
+      id: envelope.id,
+      status: envelope.status,
+      tool: envelope.trace?.tool,
+      ...(aclEvidenceStatus(envelope, aclPlatform) ? { acl_evidence: aclEvidenceStatus(envelope, aclPlatform) } : {}),
+    })),
     points_written: write.written_count,
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
@@ -2151,6 +2189,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(loginSeenError ? { login_seen_error: loginSeenError } : {}),
     // Context plan C2: the tick_summary/statistics outcome (data only; never part of `state`).
     ...(contextC2Status ? { context_c2: contextC2Status } : {}),
+    ...(hostAclEvidence === "unverified" || [...(evidence ?? []), ...(structuralEvidence ?? [])].some((envelope) => aclEvidenceStatus(envelope, aclPlatform) === "unverified")
+      ? { acl_evidence: "unverified" }
+      : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),

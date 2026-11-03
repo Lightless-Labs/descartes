@@ -13,7 +13,7 @@
 import { execFile } from "node:child_process";
 import { readdir, readFile, readlink, stat } from "node:fs/promises";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { normalizeSocketAddress, normalizeSocketProtocol, parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
@@ -61,8 +61,9 @@ async function runFixedExecFile(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 256 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
@@ -72,6 +73,8 @@ async function runFixedExecFile(command, args, options = {}) {
     // "not found or permission limited" result.
     stdout: truncate(result.stdout ?? "", options.stdoutMax ?? 2048),
     stderr: truncate(result.stderr ?? "", options.stderrMax ?? 2048),
+    binary_provenance: provenance,
+    command: result.command ? { ...result.command, binary_provenance: provenance } : result.command,
   };
 }
 
@@ -527,6 +530,7 @@ function buildNotFoundResult(kind, value, probe) {
     sockets: [],
     warnings: [],
     privilege: computePrivilege(),
+    ...(probe?.binary_provenance || probe?.binary ? { binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) } : {}),
   };
 }
 
@@ -546,6 +550,7 @@ function finalizeProvenanceResult({ targetSelection, core, sockets, privilege })
       sockets,
       warnings,
       privilege: privilege ?? computePrivilege(),
+      ...(core.binary_provenance ? { binary_provenance: core.binary_provenance } : {}),
     },
   };
 }
@@ -646,6 +651,7 @@ async function resolvePidCore(pid, options = {}) {
       resolved: { status: "unknown", pid: undefined, reason: "process_not_found_or_permission_limited" },
       ancestry: [],
       source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: "process_not_found" } },
+      binary_provenance: psResult.binary_provenance,
     };
   }
 
@@ -679,6 +685,7 @@ async function resolvePidCore(pid, options = {}) {
     },
     ancestry,
     source,
+    binary_provenance: psResult.binary_provenance,
   };
 }
 
@@ -918,6 +925,15 @@ function provenanceEnvelopeId(targetSelection) {
 // resolveCrossUidPortResult never even calls resolveElevated (see its own guard).
 export async function resolveProvenance(params = {}, options = {}) {
   let targetSelection;
+  const binaryProvenanceRecords = [];
+  const baseRunFixedExecFile = options.runFixedExecFile ?? runFixedExecFile;
+  const runTrackedExecFile = async (command, args, runOptions = {}) => {
+    const probe = await baseRunFixedExecFile(command, args, runOptions);
+    if (probe?.binary_provenance) binaryProvenanceRecords.push(probe.binary_provenance);
+    else if (probe?.binary) binaryProvenanceRecords.push(binaryProvenance(probe.binary));
+    return probe;
+  };
+  const resolverOptions = { ...options, runFixedExecFile: runTrackedExecFile };
   return timedEnvelope(async () => {
     // Target normalization runs inside the timedEnvelope-wrapped closure (not before it) so that
     // even a pathological/throwing input (not reachable through the tool schema's typed
@@ -928,7 +944,10 @@ export async function resolveProvenance(params = {}, options = {}) {
       return { status: "unknown", confidence: 0, reviewHint: "ambiguous", result: buildInvalidTargetResult(targetSelection) };
     }
 
-    const { resolvedStatus, result } = await resolveByTarget(targetSelection, options);
+    const { resolvedStatus, result } = await resolveByTarget(targetSelection, resolverOptions);
+    if (binaryProvenanceRecords.length > 0) {
+      result.binary_provenance = binaryProvenanceRecords;
+    }
     const fields = computeProvenanceEnvelopeFields(resolvedStatus, result.source?.type);
     return { status: fields.status, confidence: fields.confidence, reviewHint: fields.reviewHint, result };
   }, (built) => evidenceEnvelope({

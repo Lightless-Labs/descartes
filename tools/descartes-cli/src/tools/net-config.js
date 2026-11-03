@@ -24,7 +24,7 @@
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { finalizeCensus } from "./census-validate.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
@@ -52,8 +52,10 @@ async function defaultRunFixedExecFile(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 512 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
+  return { ...result, binary_provenance: provenance, command: result.command ? { ...result.command, binary_provenance: provenance } : result.command };
 }
 
 function probeOptions(options) {
@@ -528,7 +530,13 @@ async function readLinux(runExec, options) {
 
 export async function readNetConfig(options = {}) {
   const platform = options.platform ?? process.platform;
-  const runExec = options.runFixedExecFile ?? defaultRunFixedExecFile;
+  const provenance = [];
+  const baseRunExec = options.runFixedExecFile ?? defaultRunFixedExecFile;
+  const runExec = async (command, args, resolverOptions) => {
+    const probe = await baseRunExec(command, args, resolverOptions);
+    if (probe?.binary || probe?.binary_provenance) provenance.push(probe.binary_provenance ?? binaryProvenance(probe.binary));
+    return probe;
+  };
   let read;
   if (platform === "darwin") read = await readDarwin(runExec, options);
   else if (platform === "linux") read = await readLinux(runExec, options);
@@ -544,7 +552,7 @@ export async function readNetConfig(options = {}) {
   const status = read.route.state === "not_applicable" ? "not_applicable"
     : !["ok", "absent"].includes(read.route.state) ? read.route.state
       : states.every((state) => ["ok", "absent", "not_applicable"].includes(state)) ? "ok" : "partial";
-  return { platform, status, route: { state: read.route.state, kind: read.route.kind ?? "unknown" }, components };
+  return { platform, status, route: { state: read.route.state, kind: read.route.kind ?? "unknown" }, components, binary_provenance: provenance };
 }
 
 export async function collectNetConfigEvidence(options = {}) {

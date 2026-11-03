@@ -1,6 +1,63 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-16
+**Last updated:** 2026-11-03
+
+## Linux ACL fallback re-gate closure — 2026-11-03 — local, not pushed
+
+Closed the daybreak blocker on `fix/linux-acl-fallback-2026-11` in atomic commits `b182a95`
+(red hermetic re-gate tests), `c232642` (collector and daemon implementation), and `a95278c`
+(top-level provenance retention for structural collectors). Every direct resolver-backed collector
+now retains `binary_provenance` on successful and timed failure results. The daemon samples the
+host Linux ACL capability once per fast tick, combines it with envelope evidence, and suppresses
+the signal on macOS. The real `ps` collector path is covered end-to-end for unverified Linux,
+verified Linux, and macOS, including the daemon status and `collector.binary_state` fact surfaces.
+
+The direct resolver-backed collector list is: `certificates.js`, `containers.js`, `disks.js`,
+`host-lifecycle.js`, `login-sessions.js`, `logs.js`, `net-config.js`, `network.js`, `processes.js`,
+`provenance.js`, `provenance-warnings.js`, `scheduled-jobs.js`, `services.js`,
+`session-attachment.js`, `sessions.js`, `system.js`, `tailscale-status.js`, `time-sync.js`,
+`vms.js`, and `vpn-peer-status.js`.
+
+The new ACL re-gate tests pass **4/4**. Final fresh-XDG full `npm test` reports **2,838 tests:
+2,775 pass, 22 fail, 0 cancelled, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump loopback cases fail with sandbox `listen EPERM`, and 2 live
+process provenance checks return `unknown` under restricted macOS process introspection. No push
+or merge.
+
+## Linux ACL fallback rework — 2026-11-03 — local, not pushed
+
+On `fix/linux-acl-fallback-2026-11`, reworked the Linux ACL evidence ladder after daybreak review.
+`3943cf3` adds red hermetic coverage; `2f5ef38` implements trusted absolute `getfattr`, trusted
+GNU-coreutils-only `ls --version` fallback, full helper mode/ownership-chain validation, per-tick
+ACL-tool caching, and explicit `acl_unverified` provenance/status/fact surfaces; `487e603` updates
+the collector-state record-size pin for the new schema field. Renamed BusyBox, Toybox, uutils, and
+untrusted/attacker-controlled `ls` paths never produce ACL absence. A host without a verifiable ACL
+tool still resolves mode/ownership-trusted collectors, but records `acl_evidence: "unverified"`.
+
+Focused ACL/C2/schema verification passes **87/87**. Final fresh-XDG full `npm test` reports
+**2,834 tests: 2,771 pass, 22 fail, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump loopback cases fail with sandbox `listen EPERM`, and 2 live
+process provenance checks return `unknown` under restricted macOS process introspection. No changed-
+area product test failed. No push or merge.
+
+## Linux ACL fallback and hermetic binary resolver — 2026-11-03 — local, not pushed
+
+On `fix/linux-acl-fallback-2026-11`, made binary-resolver tests hermetic and changed trust
+evaluation to complete mode-bit/ownership checks for the executable and every ancestor before
+running ACL probes, so a rejected ancestor is deterministic and cannot be masked by an earlier
+ACL subprocess. Linux ACL detection still prefers `/usr/bin/getfattr` and `/bin/getfattr`; when
+both are absent it resolves `/bin/ls` or `/usr/bin/ls`, rejects BusyBox, runs `ls -ld --` with
+`LC_ALL=C`, and treats GNU mode markers `+`, `.`, and absent as ACL present, absent, and absent
+respectively, with malformed output or command failure unknown. Added hermetic coverage for GNU
+`ls` output shapes, BusyBox, fallback trust of `/usr/bin/ps`, and the no-ACL-before-mode-rejection
+ordering.
+
+TDD commits: `29580a2` (red hermetic/fallback tests) and `f87926b` (implementation plus strict
+parser assertion). Focused resolver verification passes **41/41**. Fresh-XDG full `npm test`:
+**2,826 tests: 2,763 pass, 22 fail, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump loopback cases fail with sandbox `listen EPERM`, and 2 live
+process provenance checks return `unknown` under this macOS host's restricted/platform-specific
+process introspection. No changed-area product test failed. No push or merge.
 
 ## C1 due-notice drain phasing and route circuit — 2026-10-16 — local, not pushed
 

@@ -19,7 +19,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { finalizeCensus } from "./census-validate.js";
 import { classifyLoginOrigin, ttyClassOf } from "./login-origin.js";
@@ -54,8 +54,10 @@ async function defaultRunFixedExecFile(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
+  return { ...result, binary_provenance: provenance, command: result.command ? { ...result.command, binary_provenance: provenance } : result.command };
 }
 
 function probeOptions(options) {
@@ -311,10 +313,10 @@ export function loginctlOrigin(session) {
 async function runWho(runExec, options) {
   throwIfCollectorAborted(options.signal);
   const probe = await runExec("who", [], probeOptions(options));
-  if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
+  if (probe.status !== "ok") return { state: failureState(probe), rows: [], binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) };
   const { rows, malformed } = parseWhoRows(probe.stdout);
   const truncated = rows.length > MAX_LOGIN_RECORDS;
-  return { state: malformed > 0 || parsedDuplicateCount(rows) > 0 || truncated ? "partial" : rows.length === 0 ? "absent" : "ok", rows, duplicate_count: parsedDuplicateCount(rows), truncated };
+  return { state: malformed > 0 || parsedDuplicateCount(rows) > 0 || truncated ? "partial" : rows.length === 0 ? "absent" : "ok", rows, duplicate_count: parsedDuplicateCount(rows), truncated, binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) };
 }
 
 function parsedDuplicateCount(rows) {
@@ -325,7 +327,7 @@ async function runLast(runExec, options) {
   throwIfCollectorAborted(options.signal);
   const shared = await readSharedLastHistory(options, runExec, probeOptions(options), LOGIN_HISTORY_LIMIT);
   const probe = shared.probe;
-  if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
+  if (probe.status !== "ok") return { state: failureState(probe), rows: [], binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) };
   const { rows, malformed } = shared;
   const duplicate_count = finalizeCensus({ records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]), malformed }).duplicate_count;
   const truncated = rows.length >= LOGIN_HISTORY_LIMIT;
@@ -342,33 +344,34 @@ async function runLast(runExec, options) {
       state: lifecycle.malformed > 0 || lifecycle.duplicate_count > 0 || lifecycleTruncated ? "partial" : lifecycle.rows.length === 0 ? "absent" : "ok",
       rows: lifecycle.rows.slice(0, MAX_LIFECYCLE_ROWS),
     },
+    binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary),
   };
 }
 
 async function runConsole(runExec, options) {
   throwIfCollectorAborted(options.signal);
   const probe = await runExec("ioreg", ["-r", "-k", "IOConsoleUsers", "-d", "1", "-a"], probeOptions(options));
-  if (probe.status !== "ok") return { state: failureState(probe) };
+  if (probe.status !== "ok") return { state: failureState(probe), binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) };
   try {
     const parsed = parseConsoleUsers(probe.stdout);
-    return { state: parsed.malformed_count > 0 || parsed.duplicate_count > 0 ? "partial" : "ok", ...parsed };
+    return { state: parsed.malformed_count > 0 || parsed.duplicate_count > 0 ? "partial" : "ok", ...parsed, binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) };
   } catch {
-    return { state: "unable" };
+    return { state: "unable", binary_provenance: probe.binary_provenance ?? binaryProvenance(probe.binary) };
   }
 }
 
 async function runLoginctl(runExec, options) {
   throwIfCollectorAborted(options.signal);
   const list = await runExec("loginctl", ["list-sessions", "--no-legend", "--no-pager"], probeOptions(options));
-  if (list.status !== "ok") return { state: failureState(list), sessions: [] };
+  if (list.status !== "ok") return { state: failureState(list), sessions: [], binary_provenance: list.binary_provenance ?? binaryProvenance(list.binary) };
   const parsedIds = parseLoginctlSessionIdsDetailed(list.stdout);
   const allIds = parsedIds.ids;
   const ids = allIds.slice(0, MAX_LOGINCTL_SESSIONS);
-  if (ids.length === 0) return { state: parsedIds.malformed_count > 0 ? "partial" : "absent", sessions: [], malformed_count: parsedIds.malformed_count };
+  if (ids.length === 0) return { state: parsedIds.malformed_count > 0 ? "partial" : "absent", sessions: [], malformed_count: parsedIds.malformed_count, binary_provenance: list.binary_provenance ?? binaryProvenance(list.binary) };
   const args = ["show-session", "--no-pager", ...LOGINCTL_PROPERTIES.flatMap((property) => ["-p", property]), ...ids];
   throwIfCollectorAborted(options.signal);
   const show = await runExec("loginctl", args, probeOptions(options));
-  if (show.status !== "ok") return { state: failureState(show), sessions: [] };
+  if (show.status !== "ok") return { state: failureState(show), sessions: [], binary_provenance: show.binary_provenance ?? binaryProvenance(show.binary) };
   const sessions = parseLoginctlShowSession(show.stdout);
   const showComplete = sessions.malformed_count === 0 && loginctlSessionBlocksMatchRequest(sessions, ids);
   const complete = parsedIds.malformed_count === 0
@@ -382,6 +385,7 @@ async function runLoginctl(runExec, options) {
     malformed_count: parsedIds.malformed_count + (sessions.malformed_count ?? 0),
     duplicate_count: parsedIds.duplicate_count + (sessions.duplicate_count ?? 0),
     truncated: allIds.length > MAX_LOGINCTL_SESSIONS,
+    binary_provenance: { list: list.binary_provenance ?? binaryProvenance(list.binary), show: show.binary_provenance ?? binaryProvenance(show.binary) },
   };
 }
 
@@ -403,11 +407,13 @@ export async function readLoginSessions(options = {}) {
   let lifecycle = { state: "not_applicable", rows: [] };
   let truncated = false;
   let presence = { screen_locked: "unknown", idle_hint: "unknown", source: "none" };
+  const binaryProvenanceBySource = {};
   const abortIfNeeded = () => throwIfCollectorAborted(options.signal);
 
   if (platform === "darwin" || platform === "linux") {
     abortIfNeeded();
     const last = await runLast(runExec, options);
+    binaryProvenanceBySource.last = last.binary_provenance;
     sources.last = last.state;
     lifecycle = last.lifecycle ?? { state: last.state === "absent" ? "absent" : last.state, rows: [] };
     truncated ||= last.truncated === true;
@@ -420,6 +426,7 @@ export async function readLoginSessions(options = {}) {
   if (platform === "darwin") {
     abortIfNeeded();
     const who = await runWho(runExec, options);
+    binaryProvenanceBySource.who = who.binary_provenance;
     // C0 review L5: rows beyond the per-read cap are not records, so the census is partial (the
     // translator then reports the current count as unknown, never the truncated number).
     sources.who = who.state === "ok" && who.rows.length > MAX_LOGIN_RECORDS ? "partial" : who.state;
@@ -431,6 +438,7 @@ export async function readLoginSessions(options = {}) {
     }
     abortIfNeeded();
     const consoleRead = await runConsole(runExec, options);
+    binaryProvenanceBySource.console = consoleRead.binary_provenance;
     sources.console = consoleRead.state === "ok" && consoleRead.users.length === 0 ? "absent" : consoleRead.state;
     if (consoleRead.state === "ok") {
       const onConsole = consoleRead.users.filter((user) => user.on_console);
@@ -446,6 +454,7 @@ export async function readLoginSessions(options = {}) {
   } else if (platform === "linux") {
     abortIfNeeded();
     const logind = await runLoginctl(runExec, options);
+    binaryProvenanceBySource.loginctl = logind.binary_provenance;
     sources.loginctl = logind.state;
     truncated ||= logind.truncated === true;
     for (const session of logind.sessions.slice(0, MAX_LOGIN_RECORDS)) {
@@ -475,7 +484,7 @@ export async function readLoginSessions(options = {}) {
   const states = Object.values(sources).filter((state) => state !== "not_applicable");
   const usable = states.filter((state) => state === "ok" || state === "absent" || state === "partial");
   const status = states.length === 0 ? "not_applicable" : usable.length === states.length && states.every((state) => state !== "partial") ? "ok" : usable.length > 0 ? "partial" : "unable";
-  return { platform, status, sources, records, history, presence, truncated, lifecycle };
+  return { platform, status, sources, records, history, presence, truncated, lifecycle, binary_provenance: binaryProvenanceBySource };
 }
 
 export async function collectLoginSessionsEvidence(options = {}) {

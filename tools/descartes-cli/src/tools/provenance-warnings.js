@@ -32,7 +32,7 @@ import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { readFile as fsReadFile } from "node:fs/promises";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { alertId } from "../alert-store.js";
 import { loadLearnedConfig } from "../constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "../diagnostics-sanitizer.js";
@@ -77,9 +77,10 @@ async function runFixedExecFile(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 512 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
-  return { ...result, status: result.status === "ok" ? "ok" : (result.availability ?? "unable") };
+  const provenance = binaryProvenance(result.binary);
+  return { ...result, status: result.status === "ok" ? "ok" : (result.availability ?? "unable"), binary_provenance: provenance, command: result.command ? { ...result.command, binary_provenance: provenance } : result.command };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -538,12 +539,21 @@ export async function snapshotProvenanceProcessesStatus(platform, options = {}) 
 export async function collectProvenanceWarningsEvidence(options = {}) {
   return timedEnvelope(async () => {
     const platform = options.platform ?? process.platform;
+    const binaryProvenanceRecords = [];
+    const baseRunFixedExecFile = options.runFixedExecFile ?? runFixedExecFile;
+    const runTrackedExecFile = async (command, args, runOptions = {}) => {
+      const probe = await baseRunFixedExecFile(command, args, runOptions);
+      if (probe?.binary_provenance) binaryProvenanceRecords.push(probe.binary_provenance);
+      else if (probe?.binary) binaryProvenanceRecords.push(binaryProvenance(probe.binary));
+      return probe;
+    };
+    const collectorOptions = { ...options, runFixedExecFile: runTrackedExecFile };
     const listSockets = options.listListeningSocketsWithPid ?? listListeningSocketsWithPid;
-    const sockets = await listSockets(platform, options);
+    const sockets = await listSockets(platform, collectorOptions);
 
     const pids = [...new Set(sockets.map((socket) => socket.pid).filter((pid) => Number.isInteger(pid)))];
     const snapshotProcesses = options.snapshotProvenanceProcesses ?? snapshotProvenanceProcesses;
-    const processes = pids.length > 0 ? await snapshotProcesses(platform, options) : [];
+    const processes = pids.length > 0 ? await snapshotProcesses(platform, collectorOptions) : [];
 
     const socketsByPid = new Map();
     for (const socket of sockets) {
@@ -567,7 +577,7 @@ export async function collectProvenanceWarningsEvidence(options = {}) {
       let executableInfo;
       if (narrowed) {
         narrowedCandidateCount += 1;
-        executableInfo = await resolveExeInfo(pid, options);
+        executableInfo = await resolveExeInfo(pid, collectorOptions);
       }
 
       // Reuses detectWarnings verbatim so severity/confidence/message stay the canonical S3
@@ -594,6 +604,7 @@ export async function collectProvenanceWarningsEvidence(options = {}) {
       checked_socket_count: sockets.length,
       narrowed_candidate_count: narrowedCandidateCount,
       warnings,
+      binary_provenance: binaryProvenanceRecords,
     };
   }, (result) => evidenceEnvelope({
     id: "provenance-warnings",

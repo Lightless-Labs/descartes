@@ -551,9 +551,8 @@ const BINARY_WALK_MAX_DEPTH = 4;
 const BINARY_WALK_MAX_ARRAY = 64;
 const BINARY_WALK_MAX_OBSERVATIONS = 256;
 // The envelopes that report binary provenance today. Bounding the walk to them bounds the per-tick
-// record count (collector_state's T8 shape): sessions (tmux, screen), vpn-peer-status (who, last, wg,
-// scutil, lsof/ss), tailscale-status (tailscale), host-lifecycle (sysctl).
-const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle", "tmux-clients"]);
+// record count (collector_state's T8 shape): fast-tick ps plus the structural collectors.
+const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["top-processes", "process-lineage-edges", "sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle", "tmux-clients"]);
 export const MAX_BINARY_STATES_PER_TICK = 12;
 
 function binaryStateOf(provenance) {
@@ -583,7 +582,7 @@ function collectBinaryProvenance(value, depth, out) {
 
 /**
  * evidence[] -> one collector.binary_state point per closed-list binary whose resolver verdict appears
- * in this tick's structural evidence (sessions' multiplexers, the VPN/peer sources, tailscale, the
+ * in this tick's evidence (fast-tick ps, sessions' multiplexers, the VPN/peer sources, tailscale, the
  * host-lifecycle sysctl). A binary no collector reported this tick is absent (not observed), never
  * "not installed". Two disagreeing verdicts in one tick are "inconsistent", never one of them. Paths
  * and content hashes are HMAC'd; the offending component is never written.
@@ -614,7 +613,11 @@ export function factPointsFromBinaryStateEvidence(evidence, { ts, hmacKey } = {}
     const paths = new Set(entry.observations.map((p) => (typeof p.resolved_path === "string" ? p.resolved_path : "")));
     const hashes = new Set(entry.observations.map((p) => (typeof p.content_hash === "string" ? p.content_hash : "")));
     const reasons = new Set(entry.observations.map((p) => (typeof p.trust_reason === "string" ? p.trust_reason : "")));
-    const consistent = states.size === 1 && paths.size === 1 && hashes.size === 1 && reasons.size === 1;
+    const aclEvidenceOf = (provenance) => provenance?.acl_evidence === "verified" || provenance?.acl_evidence === "unverified"
+      ? provenance.acl_evidence
+      : "unknown";
+    const aclEvidence = new Set(entry.observations.map(aclEvidenceOf));
+    const consistent = states.size === 1 && paths.size === 1 && hashes.size === 1 && reasons.size === 1 && aclEvidence.size === 1;
     const first = entry.observations[0];
     const state = consistent ? binaryStateOf(first) : "inconsistent";
     const resolved = state === "resolved" || state === "operator_trusted";
@@ -630,6 +633,7 @@ export function factPointsFromBinaryStateEvidence(evidence, { ts, hmacKey } = {}
       binary,
       state,
       trust_reason: reason,
+      acl_evidence: consistent ? [...aclEvidence][0] : "unknown",
       path_hmac: !consistent ? "unknown"
         : typeof first.resolved_path === "string" && first.resolved_path ? contextHmac(hmacKey, "collector_binary_path", first.resolved_path)
           : state === "not_found_on_known_paths" ? "none" : "unknown",

@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { redactAndBoundProcessArgs } from "./processes.js";
 
@@ -31,13 +31,16 @@ async function runFixedCommand(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 4500,
     maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
     stdout: truncate(result.stdout ?? "", 4096),
     stderr: truncate(result.stderr ?? "", 2048),
+    binary_provenance: provenance,
+    command: result.command ? { ...result.command, binary_provenance: provenance } : result.command,
   };
 }
 
@@ -504,6 +507,7 @@ function probeMetadata(name, result, parser, count = 0) {
     support_status: classifyCommandFailure(result),
     error: result.error,
     stderr: result.stderr,
+    binary_provenance: result.binary_provenance,
   };
 }
 

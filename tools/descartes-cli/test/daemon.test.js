@@ -174,6 +174,27 @@ test("foreground daemon iteration writes metric history and daemon status", asyn
   assert(summary.metrics.some((metric) => metric.metric_name === "system.memory.used_fraction"));
 });
 
+test("daemon status surfaces unverified ACL evidence from collector provenance", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
+  const collectors = {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0.1, 0.2, 0.3],
+      uptime_seconds: 10,
+      memory: { used_fraction: 0.4, free_bytes: 1234 },
+      swap: { used_bytes: 0 },
+      binary_provenance: { requested_binary: "ps", trust_verdict: "trusted", acl_evidence: "unverified" },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+
+  const result = await runDaemonIteration(paths, { collectors, platform: "linux", ts, now: ts });
+  assert.equal(result.status.acl_evidence, "unverified");
+  assert.equal(result.status.collector_statuses[0].acl_evidence, "unverified");
+  assert.equal((await readDaemonStatus(paths)).acl_evidence, "unverified");
+});
+
 test("daemon iteration removes the legacy binary content-pin file", async () => {
   const paths = await tempPaths();
   const legacyFile = path.join(paths.stateDir, "daemon", "binary-content-pins.json");

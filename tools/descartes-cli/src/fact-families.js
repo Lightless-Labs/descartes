@@ -297,7 +297,7 @@ const FAMILY_BUDGET_ENTRIES = [
   // session.created_vs_boot records per tick.
   ["session_context", 21 * MIB],
   // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
-  // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
+  // interval, 30 days): 720 x 12 x 696 B x 1.25 = 7,516,800 B.
   ["collector_state", 8 * MIB],
   // C2 derived families. tick_summary carries a 1,024 B summary plus a 974 B certificate sibling per
   // structural tick; 3 MiB holds the 90-day retention at a 1 h interval. context_stats carries at
@@ -347,8 +347,8 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // at most 573 B, counted at the family's 643 B record maximum.
   // + MAX_CREATED_VS_BOOT_PER_TICK (8) session.created_vs_boot records of at most 623 B.
   ["session_context", { maxRecordBytes: 643, markerBytes: 1893, entityCap: 32 }],
-  // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
-  ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
+  // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 696 B.
+  ["collector_state", { maxRecordBytes: 696, markerBytes: 0, entityCap: 12 }],
   // C2: the exact worst cases (no envelope source, fixed entity key; pinned in context-c2-summary.test.js).
   ["context_stats", { maxRecordBytes: 0, markerBytes: 548 + 556, entityCap: 0 }],
   // C2 H1: one compact sibling certificate table accompanies each summary. The summary itself remains

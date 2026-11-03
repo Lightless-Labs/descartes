@@ -459,7 +459,7 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     "net.tailnet_state": 601, "net.config_fingerprint": 1029,
     "session.login_record": 643, "session.login_history_row": 597, "session.login_census": 777, "user.presence": 508,
     // C2 facts (their families' T8 are pinned in context-c2-*.test.js).
-    "collector.binary_state": 668, "net.vpn_service_census": 614, "net.vpn_service_state": 528,
+    "collector.binary_state": 696, "net.vpn_service_census": 614, "net.vpn_service_state": 528,
     "host.lifecycle_record": 721, "session.attachment_census": 608, "session.attachment": 573,
     "host.daemon_gap": 679, "context.transition": 699, "session.created_vs_boot": 623,
     // Derived records: an upper bound under this generic shape (a longest envelope source, a suffixed

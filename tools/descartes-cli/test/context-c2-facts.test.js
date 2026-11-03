@@ -65,6 +65,15 @@ test("C2 collector.binary_state: one fact per observed binary from the resolver 
   assert.equal(byBinary.last.attributes.state, "unable", "an unrecognised verdict is unable, never resolved");
 });
 
+test("C2 collector.binary_state surfaces unverified Linux ACL evidence", () => {
+  const points = valid(factPointsFromBinaryStateEvidence([
+    { id: "sessions", result: { multiplexers: [{ binary_provenance: prov("tmux", "trusted", { acl_evidence: "unverified" }) }] } },
+  ], { ts: TS, hmacKey: KEY }));
+
+  const point = points.find((candidate) => candidate.entity_key === "collector.binary_state.tmux");
+  assert.equal(point.attributes.acl_evidence, "unverified");
+});
+
 test("C2 collector.binary_state: disagreeing reads in one tick are inconsistent; daemon-synthesized and unlisted envelopes are ignored; no key means unknown HMACs", () => {
   const evidence = [
     { id: "vpn-peer-status", result: { sources: { a: { binary_provenance: prov("lsof", "trusted", { resolved_path: "/usr/sbin/lsof" }) }, b: { binary_provenance: prov("lsof", "untrusted_binary", { resolved_path: "/usr/sbin/lsof", trust_reason: "acl_present" }) } } } },

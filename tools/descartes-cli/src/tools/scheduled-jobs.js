@@ -4,7 +4,7 @@ import { access, lstat, open, readdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { redactAndBoundProcessArgs } from "./processes.js";
 
@@ -40,13 +40,16 @@ async function runFixedCommand(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 3500,
     maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
     stdout: truncate(result.stdout ?? "", 4096),
     stderr: truncate(result.stderr ?? "", 2048),
+    binary_provenance: provenance,
+    command: result.command ? { ...result.command, binary_provenance: provenance } : result.command,
   };
 }
 
@@ -314,6 +317,7 @@ async function collectCronJobs({ limit, includeSystem, includeUser, resolverOpti
       source: "user_crontab",
       status: noCrontab ? "absent" : userCrontab.status,
       command: userCrontab.command,
+      binary_provenance: userCrontab.binary_provenance,
       stderr: userCrontab.stderr,
       error: noCrontab ? undefined : userCrontab.error,
       job_count: parsedJobs.length,
@@ -375,13 +379,13 @@ async function collectSystemdTimers({ limit, includeSystem, includeUser, resolve
     const command = await runFixedCommand("systemctl", ["list-timers", "--all", "--no-pager", "--no-legend"], resolverOptions);
     const parsed = command.status === "ok" ? parseSystemctlListTimers(command.stdout, { scope: "system" }) : [];
     jobs.push(...parsed);
-    probes.push({ source: "systemd_timers", status: command.status, command: command.command, stderr: command.stderr, error: command.error, job_count: parsed.length });
+    probes.push({ source: "systemd_timers", status: command.status, command: command.command, binary_provenance: command.binary_provenance, stderr: command.stderr, error: command.error, job_count: parsed.length });
   }
   if (includeUser) {
     const command = await runFixedCommand("systemctl", ["--user", "list-timers", "--all", "--no-pager", "--no-legend"], resolverOptions);
     const parsed = command.status === "ok" ? parseSystemctlListTimers(command.stdout, { scope: "user" }) : [];
     jobs.push(...parsed);
-    probes.push({ source: "systemd_user_timers", status: command.status, command: command.command, stderr: command.stderr, error: command.error, job_count: parsed.length });
+    probes.push({ source: "systemd_user_timers", status: command.status, command: command.command, binary_provenance: command.binary_provenance, stderr: command.stderr, error: command.error, job_count: parsed.length });
   }
   return { jobs, probes };
 }
@@ -422,16 +426,16 @@ async function collectLaunchdScheduledJobs({ limit, includeSystem, includeUser, 
   for (const file of files) {
     const command = await runFixedCommand("plutil", ["-convert", "json", "-o", "-", file.path], { ...resolverOptions, timeout: 2500 });
     if (command.status !== "ok") {
-      probes.push({ source: "launchd_plist", status: "unable", path: file.path, command: command.command, stderr: command.stderr, error: command.error, job_count: 0 });
+      probes.push({ source: "launchd_plist", status: "unable", path: file.path, command: command.command, binary_provenance: command.binary_provenance, stderr: command.stderr, error: command.error, job_count: 0 });
       continue;
     }
     try {
       const parsed = JSON.parse(command.stdout);
       const job = parseLaunchdPlistObject(parsed, { path: file.path, scope: file.scope });
       if (job) jobs.push(job);
-      probes.push({ source: "launchd_plist", status: "ok", path: file.path, command: command.command, job_count: job ? 1 : 0 });
+      probes.push({ source: "launchd_plist", status: "ok", path: file.path, command: command.command, binary_provenance: command.binary_provenance, job_count: job ? 1 : 0 });
     } catch (error) {
-      probes.push({ source: "launchd_plist", status: "unable", path: file.path, command: command.command, error: `invalid plist json: ${error instanceof Error ? error.message : String(error)}`, job_count: 0 });
+      probes.push({ source: "launchd_plist", status: "unable", path: file.path, command: command.command, binary_provenance: command.binary_provenance, error: `invalid plist json: ${error instanceof Error ? error.message : String(error)}`, job_count: 0 });
     }
     if (jobs.length >= limit) break;
   }

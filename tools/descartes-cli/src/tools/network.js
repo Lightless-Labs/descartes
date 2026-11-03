@@ -4,7 +4,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { finalizeCensus } from "./census-validate.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
@@ -30,13 +30,16 @@ async function runFixedCommand(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 2500,
     maxBuffer: options.maxBuffer ?? 1024 * 512,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
     stdout: truncate(result.stdout ?? "", 2048),
     stderr: truncate(result.stderr ?? "", 2048),
+    binary_provenance: provenance,
+    command: result.command ? { ...result.command, binary_provenance: provenance } : result.command,
   };
 }
 

@@ -2,7 +2,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -31,9 +31,10 @@ async function collectSwap(options = {}) {
         ...options,
         timeout: 2000,
         maxBuffer: 1024 * 64,
-        execFileAsync,
+        execFileAsync: options.execFileAsync ?? execFileAsync,
       });
-      if (result.status !== "ok") return { unable: result.error, status: result.availability ?? "unable", source: "sysctl vm.swapusage" };
+      const binary_provenance = binaryProvenance(result.binary);
+      if (result.status !== "ok") return { unable: result.error, status: result.availability ?? "unable", source: "sysctl vm.swapusage", binary_provenance };
       const { stdout } = result;
       const total = stdout.match(/total = ([\d.]+)([MG])/)?.slice(1, 3);
       const used = stdout.match(/used = ([\d.]+)([MG])/)?.slice(1, 3);
@@ -48,6 +49,7 @@ async function collectSwap(options = {}) {
         used_bytes: toBytes(used),
         free_bytes: toBytes(free),
         source: "sysctl vm.swapusage",
+        binary_provenance,
       };
     } catch (error) {
       return { unable: error instanceof Error ? error.message : String(error), source: "sysctl vm.swapusage" };

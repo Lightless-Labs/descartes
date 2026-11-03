@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -45,14 +45,16 @@ async function runFixedCommand(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
     maxBuffer: options.maxBuffer ?? 512 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
     stdout: truncate(result.stdout ?? "", 4096),
     stderr: truncate(result.stderr ?? "", 2048),
-    command: { ...result.command, network: options.network ?? false },
+    command: { ...result.command, network: options.network ?? false, binary_provenance: provenance },
+    binary_provenance: provenance,
   };
 }
 
