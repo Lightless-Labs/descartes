@@ -364,7 +364,7 @@ async function loadGroupWriterUids(gid, {
 
 function normalizeAclStatus(result) {
   const status = typeof result === "string" ? result : result?.status;
-  return status === "present" || status === "absent" ? status : "unknown";
+  return status === "present" || status === "absent" || status === "acl_unverified" ? status : "unknown";
 }
 
 async function readContent(readFileFn, resolvedPath) {
@@ -411,32 +411,104 @@ export function parseLinuxAclStatus(stdout) {
   return mode[10] === "+" ? "present" : "absent";
 }
 
-async function detectLinuxAclWithLs(component, { execFileAsync, realpathFn, signal }) {
-  for (const command of LINUX_LS_COMMANDS) {
+function trustedLinuxModeOwnershipChain(resolvedPath, { statFn, expectedUid }) {
+  return (async () => {
+    const fileResult = await safeStat(statFn, resolvedPath);
+    if (!fileResult.stat || !isRegularExecutable(fileResult.stat)) return false;
+    for (const component of [resolvedPath, ...ancestorPaths(resolvedPath)]) {
+      const result = component === resolvedPath ? fileResult : await safeStat(statFn, component);
+      if (!result.stat) return false;
+      if (component !== resolvedPath && !result.stat.isDirectory?.()) return false;
+      const ownerUid = asUid(result.stat.uid);
+      if (ownerUid !== 0 && ownerUid !== expectedUid) return false;
+      const mode = Number(result.stat.mode);
+      if ((mode & 0o022) !== 0) return false;
+    }
+    return true;
+  })();
+}
+
+function linuxAclToolCache(cache) {
+  cache.linuxAclTools ??= new Map();
+  return cache.linuxAclTools;
+}
+
+async function resolveTrustedLinuxTool(commands, {
+  kind,
+  statFn,
+  expectedUid,
+  realpathFn,
+  execFileAsync,
+  aclToolCache = {},
+  signal,
+} = {}) {
+  const cache = linuxAclToolCache(aclToolCache);
+  if (cache.has(kind)) return cache.get(kind);
+
+  let resolved;
+  for (const command of commands) {
     throwIfCollectorAborted(signal);
     const real = await safeRealpath(realpathFn, command);
     if (!real.path) {
       if (missing(real.error)) continue;
-      return "unknown";
+      continue;
     }
-    if (!path.isAbsolute(real.path) || path.basename(real.path) === "busybox") return "unknown";
-    const result = await execLookup(
-      execFileAsync,
-      real.path,
-      ["-ld", "--", component],
-      signal,
-      { env: { ...process.env, LC_ALL: "C" } },
-    );
-    return result.error ? "unknown" : parseLinuxAclStatus(result.stdout);
+    if (!path.isAbsolute(real.path)) continue;
+    if (!await trustedLinuxModeOwnershipChain(real.path, { statFn, expectedUid })) continue;
+    if (kind === "ls") {
+      const version = await execLookup(
+        execFileAsync,
+        real.path,
+        ["--version"],
+        signal,
+        { env: { ...process.env, LC_ALL: "C" } },
+      );
+      const firstLine = String(version.stdout ?? "").split(/\r?\n/, 1)[0];
+      if (version.error || !firstLine.includes("(GNU coreutils)")) continue;
+    }
+    resolved = real.path;
+    break;
   }
-  return "unknown";
+  cache.set(kind, resolved);
+  return resolved;
+}
+
+async function detectLinuxAclWithLs(component, {
+  statFn,
+  expectedUid,
+  execFileAsync,
+  realpathFn,
+  aclToolCache,
+  signal,
+}) {
+  const command = await resolveTrustedLinuxTool(LINUX_LS_COMMANDS, {
+    kind: "ls",
+    statFn,
+    expectedUid,
+    realpathFn,
+    execFileAsync,
+    aclToolCache,
+    signal,
+  });
+  if (!command) return "acl_unverified";
+  const result = await execLookup(
+    execFileAsync,
+    command,
+    ["-ld", "--", component],
+    signal,
+    { env: { ...process.env, LC_ALL: "C" } },
+  );
+  return result.error ? "unknown" : parseLinuxAclStatus(result.stdout);
 }
 
 export async function detectAclStatus(component, {
   platform,
   stat,
+  statFn = defaultStat,
+  expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined,
   execFileAsync = execFileAsyncDefault,
   realpathFn = defaultRealpath,
+  aclToolCache = {},
   signal,
 } = {}) {
   if (platform === "darwin") {
@@ -444,18 +516,23 @@ export async function detectAclStatus(component, {
     return result.error ? "unknown" : parseMacOsAclStatus(result.stdout);
   }
   if (platform === "linux") {
+    if (!path.isAbsolute(component)) return "acl_unverified";
     const attributes = stat?.isDirectory?.()
       ? LINUX_ACL_ATTRIBUTES
       : [LINUX_ACL_ATTRIBUTES[0]];
-    let getfattrFound = false;
-    for (const command of LINUX_XATTR_COMMANDS) {
-      let commandUnavailable = true;
+    const getfattr = await resolveTrustedLinuxTool(LINUX_XATTR_COMMANDS, {
+      kind: "getfattr",
+      statFn,
+      expectedUid,
+      realpathFn,
+      execFileAsync,
+      aclToolCache,
+      signal,
+    });
+    if (getfattr) {
       for (const attribute of attributes) {
-        const result = await execLookup(execFileAsync, command, ["--only-values", `--name=${attribute}`, "--absolute-names", component], signal);
+        const result = await execLookup(execFileAsync, getfattr, ["--only-values", `--name=${attribute}`, "--absolute-names", component], signal);
         if (!result.error) return "present";
-        if (result.error.code === "ENOENT") continue;
-        commandUnavailable = false;
-        getfattrFound = true;
         // A missing attribute is the only trustworthy proof that no ACL is present. In
         // particular, getfattr's exit status 1 is ambiguous unless its stderr identifies the
         // requested attribute as absent; permission, unsupported-filesystem, and other errors
@@ -463,9 +540,16 @@ export async function detectAclStatus(component, {
         if (result.error.code === "ENODATA" || /no such attribute/i.test(String(result.error.stderr ?? ""))) continue;
         return "unknown";
       }
-      if (!commandUnavailable) return "absent";
+      return "absent";
     }
-    if (!getfattrFound) return detectLinuxAclWithLs(component, { execFileAsync, realpathFn, signal });
+    return detectLinuxAclWithLs(component, {
+      statFn,
+      expectedUid,
+      execFileAsync,
+      realpathFn,
+      aclToolCache,
+      signal,
+    });
   }
   return "unknown";
 }
@@ -479,6 +563,7 @@ async function inspectTrustedPath(resolvedPath, {
   groupWriterUidsFn = loadGroupWriterUids,
   groupWriterCache = {},
   aclCheckFn = detectAclStatus,
+  aclToolCache = {},
   realpathFn = defaultRealpath,
   execFileAsync = execFileAsyncDefault,
   signal,
@@ -561,14 +646,22 @@ async function inspectTrustedPath(resolvedPath, {
     }
   }
 
+  let aclEvidence = "verified";
   for (const { component, stat, writerUids } of componentResults) {
     const aclStatus = normalizeAclStatus(await aclCheckFn(component, {
       platform,
       stat,
+      statFn,
+      expectedUid,
       execFileAsync,
       realpathFn,
+      aclToolCache,
       signal,
     }));
+    if (aclStatus === "acl_unverified") {
+      aclEvidence = "unverified";
+      continue;
+    }
     if (aclStatus !== "absent") {
       return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
@@ -591,6 +684,7 @@ async function inspectTrustedPath(resolvedPath, {
     accepted_system_accounts: acceptedSystemAccounts,
     file_stat: fileResult.stat,
     content_hash: content.hash,
+    ...(aclEvidence === "unverified" ? { acl_evidence: aclEvidence } : {}),
   };
 }
 
@@ -618,6 +712,7 @@ export async function resolveCollectorBinary(binary, {
   groupWriterCache = {},
   execFileAsync = execFileAsyncDefault,
   aclCheckFn = detectAclStatus,
+  aclToolCache = {},
   signal,
 } = {}) {
   const name = String(binary ?? "");
@@ -649,6 +744,7 @@ export async function resolveCollectorBinary(binary, {
       groupWriterCache,
       execFileAsync,
       aclCheckFn,
+      aclToolCache,
       realpathFn,
       signal,
     });
@@ -690,6 +786,7 @@ export function binaryProvenance(probe) {
     trust_reason: binary?.trust_reason,
     ...(binary?.operator_override_hint ? { operator_override_hint: binary.operator_override_hint } : {}),
     ...(typeof binary?.content_hash === "string" ? { content_hash: binary.content_hash } : {}),
+    ...(binary?.acl_evidence === "unverified" ? { acl_evidence: "unverified" } : {}),
     same_uid_writable_components: binary?.same_uid_writable_components ?? [],
     ...((binary?.accepted_system_accounts?.length ?? 0) > 0
       ? { accepted_system_accounts: binary.accepted_system_accounts }

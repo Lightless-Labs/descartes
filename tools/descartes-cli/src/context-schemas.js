@@ -333,6 +333,7 @@ const FACT_SCHEMA_ENTRIES = [
       // C0.1's states, plus "inconsistent": two reads of the same binary in one tick disagreed.
       state: enumField(["resolved", "operator_trusted", "not_found_on_known_paths", "untrusted_binary", "unable", "inconsistent"], ["fs.collector_binary"]),
       trust_reason: enumField(["none", "other", "unknown", ...BINARY_TRUST_REASONS], ["fs.collector_binary"]),
+      acl_evidence: enumField(["verified", "unverified", "unknown"], ["fs.collector_binary"]),
       path_hmac: hmacField(["fs.collector_binary"], [SENTINEL_UNKNOWN, "none"]),
       content_hmac: hmacField(["fs.collector_binary"], [SENTINEL_UNKNOWN, "none"]),
       same_uid_writable: enumField(["true", "false", "unknown"], ["fs.collector_binary"]),

@@ -162,6 +162,9 @@ test("Linux ACL probe does not treat a bare getfattr exit 1 as proof that an ACL
   const status = await detectAclStatus("/usr/bin/tmux", {
     platform: "linux",
     stat: regularExecutable(),
+    expectedUid: 0,
+    statFn: trustedStats("/usr/bin/getfattr", { ancestors: { "/usr/bin": directory(), "/usr": directory() } }),
+    realpathFn: async (target) => target === "/usr/bin/getfattr" ? target : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     execFileAsync: async () => {
       throw Object.assign(new Error("Permission denied"), { code: 1, stderr: "Permission denied" });
     },
@@ -175,6 +178,9 @@ test("Linux ACL probe accepts only explicit absent-attribute evidence for access
   const status = await detectAclStatus("/usr/local/bin", {
     platform: "linux",
     stat: directory(),
+    expectedUid: 0,
+    statFn: trustedStats("/usr/bin/getfattr", { ancestors: { "/usr/bin": directory(), "/usr": directory() } }),
+    realpathFn: async (target) => target === "/usr/bin/getfattr" ? target : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     execFileAsync: async (command, args) => {
       calls.push(args);
       throw Object.assign(new Error("No such attribute"), { code: 1, stderr: "getfattr: /usr/local/bin: No such attribute" });
@@ -189,6 +195,9 @@ test("Linux ACL probe accepts ENODATA as absent but keeps other nonzero ACL erro
   const absent = await detectAclStatus("/usr/bin/tmux", {
     platform: "linux",
     stat: regularExecutable(),
+    expectedUid: 0,
+    statFn: trustedStats("/usr/bin/getfattr", { ancestors: { "/usr/bin": directory(), "/usr": directory() } }),
+    realpathFn: async (target) => target === "/usr/bin/getfattr" ? target : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     execFileAsync: async () => {
       throw Object.assign(new Error("No data"), { code: "ENODATA", stderr: "" });
     },
@@ -196,6 +205,9 @@ test("Linux ACL probe accepts ENODATA as absent but keeps other nonzero ACL erro
   const unknown = await detectAclStatus("/usr/bin/tmux", {
     platform: "linux",
     stat: regularExecutable(),
+    expectedUid: 0,
+    statFn: trustedStats("/usr/bin/getfattr", { ancestors: { "/usr/bin": directory(), "/usr": directory() } }),
+    realpathFn: async (target) => target === "/usr/bin/getfattr" ? target : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     execFileAsync: async () => {
       throw Object.assign(new Error("unsupported"), { code: 95, stderr: "Operation not supported" });
     },
@@ -218,10 +230,13 @@ test("Linux ACL probe falls back to resolved GNU ls when getfattr is unavailable
   const status = await detectAclStatus("/usr/bin/ps", {
     platform: "linux",
     stat: regularExecutable(),
+    expectedUid: 0,
+    statFn: trustedStats("/usr/bin/coreutils-ls", { ancestors: { "/usr/bin": directory(), "/usr": directory() } }),
     realpathFn: async (target) => target === "/bin/ls" ? "/usr/bin/coreutils-ls" : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     execFileAsync: async (command, args, options) => {
       calls.push({ command, args, options });
       if (command.endsWith("getfattr")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      if (args[0] === "--version") return { stdout: "ls (GNU coreutils) 9.5\n", stderr: "" };
       return { stdout: "-rwxr-xr-x 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" };
     },
   });
@@ -236,10 +251,14 @@ test("Linux ACL probe reports ACL presence from resolved GNU ls output", async (
   const status = await detectAclStatus("/usr/bin/ps", {
     platform: "linux",
     stat: regularExecutable(),
+    expectedUid: 0,
+    statFn: trustedStats("/usr/bin/ls", { ancestors: { "/usr/bin": directory(), "/usr": directory() } }),
     realpathFn: async (target) => target === "/bin/ls" ? "/usr/bin/ls" : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    execFileAsync: async (command) => command.endsWith("getfattr")
+    execFileAsync: async (command, args) => command.endsWith("getfattr")
       ? Promise.reject(Object.assign(new Error("missing"), { code: "ENOENT" }))
-      : { stdout: "-rwxr-xr-x+ 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" },
+      : args[0] === "--version"
+        ? { stdout: "ls (GNU coreutils) 9.5\n", stderr: "" }
+        : { stdout: "-rwxr-xr-x+ 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" },
   });
 
   assert.equal(status, "present");
@@ -364,7 +383,7 @@ test("Linux ACL tool resolution is cached for a tick", async () => {
   assert.equal(await detectAclStatus("/usr/bin/ps", options), "absent");
   assert.equal(await detectAclStatus("/usr/bin/ps", options), "absent");
   assert.equal(versionCalls, 1);
-  assert.equal(realpathCalls, 1);
+  assert.equal(realpathCalls, 3);
 });
 
 test("Linux ACL probe fails closed when the resolved ls is BusyBox", async () => {
@@ -372,16 +391,18 @@ test("Linux ACL probe fails closed when the resolved ls is BusyBox", async () =>
   const status = await detectAclStatus("/usr/bin/ps", {
     platform: "linux",
     stat: regularExecutable(),
+    expectedUid: 0,
+    statFn: trustedStats("/bin/busybox", { ancestors: { "/bin": directory() } }),
     realpathFn: async (target) => target === "/bin/ls" ? "/bin/busybox" : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    execFileAsync: async (command) => {
-      calls.push(command);
+    execFileAsync: async (command, args) => {
+      calls.push({ command, args });
       if (command.endsWith("getfattr")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
-      throw new Error("BusyBox must not be executed");
+      throw new Error("BusyBox is not GNU");
     },
   });
 
-  assert.equal(status, "unknown");
-  assert.equal(calls.some((command) => command.endsWith("/busybox")), false);
+  assert.equal(status, "acl_unverified");
+  assert.equal(calls.some(({ command, args }) => command.endsWith("/busybox") && args[0] === "-ld"), false);
 });
 
 test("resolveCollectorBinary trusts Linux ps when getfattr is absent and GNU ls shows no ACL", async () => {
@@ -392,12 +413,16 @@ test("resolveCollectorBinary trusts Linux ps when getfattr is absent and GNU ls 
       if (candidate === "/bin/ls") return "/usr/bin/ls";
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
-    statFn: trustedStats("/usr/bin/ps", {
-      ancestors: { "/usr": directory(), "/usr/bin": directory() },
-    }),
+    statFn: async (target) => {
+      if (target === "/usr/bin/ps" || target === "/usr/bin/ls") return regularExecutable();
+      if (target === "/usr/bin" || target === "/usr") return directory();
+      if (target === "/") return directory();
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    },
     readFileFn: readableBinary,
-    execFileAsync: async (command) => {
+    execFileAsync: async (command, args) => {
       if (command.endsWith("getfattr")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      if (args[0] === "--version") return { stdout: "ls (GNU coreutils) 9.5\n", stderr: "" };
       return { stdout: "-rwxr-xr-x 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" };
     },
     expectedUid: 0,

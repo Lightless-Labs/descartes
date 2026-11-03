@@ -614,7 +614,11 @@ export function factPointsFromBinaryStateEvidence(evidence, { ts, hmacKey } = {}
     const paths = new Set(entry.observations.map((p) => (typeof p.resolved_path === "string" ? p.resolved_path : "")));
     const hashes = new Set(entry.observations.map((p) => (typeof p.content_hash === "string" ? p.content_hash : "")));
     const reasons = new Set(entry.observations.map((p) => (typeof p.trust_reason === "string" ? p.trust_reason : "")));
-    const consistent = states.size === 1 && paths.size === 1 && hashes.size === 1 && reasons.size === 1;
+    const aclEvidenceOf = (provenance) => provenance?.acl_evidence === "verified" || provenance?.acl_evidence === "unverified"
+      ? provenance.acl_evidence
+      : "unknown";
+    const aclEvidence = new Set(entry.observations.map(aclEvidenceOf));
+    const consistent = states.size === 1 && paths.size === 1 && hashes.size === 1 && reasons.size === 1 && aclEvidence.size === 1;
     const first = entry.observations[0];
     const state = consistent ? binaryStateOf(first) : "inconsistent";
     const resolved = state === "resolved" || state === "operator_trusted";
@@ -630,6 +634,7 @@ export function factPointsFromBinaryStateEvidence(evidence, { ts, hmacKey } = {}
       binary,
       state,
       trust_reason: reason,
+      acl_evidence: consistent ? [...aclEvidence][0] : "unknown",
       path_hmac: !consistent ? "unknown"
         : typeof first.resolved_path === "string" && first.resolved_path ? contextHmac(hmacKey, "collector_binary_path", first.resolved_path)
           : state === "not_found_on_known_paths" ? "none" : "unknown",
