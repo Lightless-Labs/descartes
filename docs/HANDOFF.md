@@ -2,6 +2,20 @@
 
 **Last updated:** 2026-11-03
 
+> **RESUME HERE (2026-11-03) — main CI GREEN again: origin/main @5bf4733, Buildkite #284 passed.**
+> The red main (since the capacity merge) had two causes: a non-hermetic resolver test, and a real
+> Linux regression where hosts without `getfattr` marked every collector binary untrusted (Linux
+> collection silently off). Fixed by the ACL evidence ladder (`ba2f6b1`; daybreak READY after 3
+> rounds, reports in `docs/reviews/2026-11-03-daybreak-linux-acl-fallback.md`). Unsandboxed local
+> suite on the merged tree: 2,798 pass / 0 fail.
+> **Next action: cut v0.0.51** (bump `package.json` + `tools/descartes-cli/package.json` to 0.0.51,
+> `chore: release v0.0.51` commit, annotated tag `v0.0.51`, push main + tag). The tag build runs
+> the macOS notifier release, the GitHub release and the Homebrew tap bump. v0.0.50 was tagged
+> but never released; the tap is still at v0.0.49 and the operator's daemon at v0.0.47. Tagging
+> publishes to the public tap, so it needs the operator's explicit go-ahead (auto mode blocked it).
+> Then: root-helper branch (`harden/root-helper-2026-10`) re-run CI and merge; C1a arbitration;
+> C0.9 clock measurement.
+
 ## Linux ACL fallback re-gate closure — 2026-11-03 — local, not pushed
 
 Closed the daybreak blocker on `fix/linux-acl-fallback-2026-11` in atomic commits `b182a95`
