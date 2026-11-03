@@ -925,6 +925,15 @@ function provenanceEnvelopeId(targetSelection) {
 // resolveCrossUidPortResult never even calls resolveElevated (see its own guard).
 export async function resolveProvenance(params = {}, options = {}) {
   let targetSelection;
+  const binaryProvenanceRecords = [];
+  const baseRunFixedExecFile = options.runFixedExecFile ?? runFixedExecFile;
+  const runTrackedExecFile = async (command, args, runOptions = {}) => {
+    const probe = await baseRunFixedExecFile(command, args, runOptions);
+    if (probe?.binary_provenance) binaryProvenanceRecords.push(probe.binary_provenance);
+    else if (probe?.binary) binaryProvenanceRecords.push(binaryProvenance(probe.binary));
+    return probe;
+  };
+  const resolverOptions = { ...options, runFixedExecFile: runTrackedExecFile };
   return timedEnvelope(async () => {
     // Target normalization runs inside the timedEnvelope-wrapped closure (not before it) so that
     // even a pathological/throwing input (not reachable through the tool schema's typed
@@ -935,7 +944,10 @@ export async function resolveProvenance(params = {}, options = {}) {
       return { status: "unknown", confidence: 0, reviewHint: "ambiguous", result: buildInvalidTargetResult(targetSelection) };
     }
 
-    const { resolvedStatus, result } = await resolveByTarget(targetSelection, options);
+    const { resolvedStatus, result } = await resolveByTarget(targetSelection, resolverOptions);
+    if (binaryProvenanceRecords.length > 0) {
+      result.binary_provenance = binaryProvenanceRecords;
+    }
     const fields = computeProvenanceEnvelopeFields(resolvedStatus, result.source?.type);
     return { status: fields.status, confidence: fields.confidence, reviewHint: fields.reviewHint, result };
   }, (built) => evidenceEnvelope({
