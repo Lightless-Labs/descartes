@@ -4,6 +4,7 @@ import {
   candidatePaths,
   binaryProvenance,
   detectAclStatus,
+  parseLinuxAclStatus,
   parseMacOsAclStatus,
   resolveCollectorBinary,
   runResolvedExecFile,
@@ -93,6 +94,7 @@ test("candidatePaths includes the standard Nix profile locations for the daemon 
 });
 
 test("resolveCollectorBinary rejects a candidate in a world-writable directory as untrusted_binary", async () => {
+  const aclCalls = [];
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
     realpathFn: async (candidate) => {
@@ -107,11 +109,16 @@ test("resolveCollectorBinary rejects a candidate in a world-writable directory a
       if (candidate === "/") return directory(0o40755, 0);
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
+    aclCheckFn: async (component) => {
+      aclCalls.push(component);
+      return "absent";
+    },
   });
 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.path, undefined);
   assert.equal(resolution.offending_component, "/opt/homebrew/bin");
+  assert.deepEqual(aclCalls, [], "mode-bit rejection must precede every ACL probe");
 });
 
 test("resolveCollectorBinary rejects an ACL-granted writer even when mode bits look safe", async () => {
@@ -198,6 +205,86 @@ test("Linux ACL probe accepts ENODATA as absent but keeps other nonzero ACL erro
   assert.equal(unknown, "unknown");
 });
 
+test("parseLinuxAclStatus recognizes real GNU ls mode fields", () => {
+  assert.equal(parseLinuxAclStatus("-rwxr-xr-x 1 root root 123 Jan  1 00:00 /usr/bin/ps\n"), "absent");
+  assert.equal(parseLinuxAclStatus("-rwxr-xr-x+ 1 root root 123 Jan  1 00:00 /usr/bin/ps\n"), "present");
+  assert.equal(parseLinuxAclStatus("-rwxr-xr-x. 1 root root 123 Jan  1 00:00 /usr/bin/ps\n"), "absent");
+  assert.equal(parseLinuxAclStatus("not ls output\n"), "unknown");
+});
+
+test("Linux ACL probe falls back to resolved GNU ls when getfattr is unavailable", async () => {
+  const calls = [];
+  const status = await detectAclStatus("/usr/bin/ps", {
+    platform: "linux",
+    stat: regularExecutable(),
+    realpathFn: async (target) => target === "/bin/ls" ? "/usr/bin/coreutils-ls" : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    execFileAsync: async (command, args, options) => {
+      calls.push({ command, args, options });
+      if (command.endsWith("getfattr")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      return { stdout: "-rwxr-xr-x 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" };
+    },
+  });
+
+  assert.equal(status, "absent");
+  assert.equal(calls.at(-1).command, "/usr/bin/coreutils-ls");
+  assert.deepEqual(calls.at(-1).args, ["-ld", "--", "/usr/bin/ps"]);
+  assert.equal(calls.at(-1).options.env.LC_ALL, "C");
+});
+
+test("Linux ACL probe reports ACL presence from resolved GNU ls output", async () => {
+  const status = await detectAclStatus("/usr/bin/ps", {
+    platform: "linux",
+    stat: regularExecutable(),
+    realpathFn: async (target) => target === "/bin/ls" ? "/usr/bin/ls" : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    execFileAsync: async (command) => command.endsWith("getfattr")
+      ? Promise.reject(Object.assign(new Error("missing"), { code: "ENOENT" }))
+      : { stdout: "-rwxr-xr-x+ 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" },
+  });
+
+  assert.equal(status, "present");
+});
+
+test("Linux ACL probe fails closed when the resolved ls is BusyBox", async () => {
+  const calls = [];
+  const status = await detectAclStatus("/usr/bin/ps", {
+    platform: "linux",
+    stat: regularExecutable(),
+    realpathFn: async (target) => target === "/bin/ls" ? "/bin/busybox" : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    execFileAsync: async (command) => {
+      calls.push(command);
+      if (command.endsWith("getfattr")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      throw new Error("BusyBox must not be executed");
+    },
+  });
+
+  assert.equal(status, "unknown");
+  assert.equal(calls.some((command) => command.endsWith("/busybox")), false);
+});
+
+test("resolveCollectorBinary trusts Linux ps when getfattr is absent and GNU ls shows no ACL", async () => {
+  const resolution = await resolveCollectorBinary("ps", {
+    platform: "linux",
+    realpathFn: async (candidate) => {
+      if (candidate === "/usr/bin/ps") return candidate;
+      if (candidate === "/bin/ls") return "/usr/bin/ls";
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    },
+    statFn: trustedStats("/usr/bin/ps", {
+      ancestors: { "/usr": directory(), "/usr/bin": directory() },
+    }),
+    readFileFn: readableBinary,
+    execFileAsync: async (command) => {
+      if (command.endsWith("getfattr")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      return { stdout: "-rwxr-xr-x 1 root root 123 Jan  1 00:00 /usr/bin/ps\n", stderr: "" };
+    },
+    expectedUid: 0,
+  });
+
+  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
+  assert.equal(resolution.path, "/usr/bin/ps");
+  assert.equal(resolution.trust_verdict, "trusted");
+});
+
 test("resolveCollectorBinary rejects a non-writable executable owned by another user", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "linux",
@@ -210,6 +297,7 @@ test("resolveCollectorBinary rejects a non-writable executable owned by another 
       },
     }),
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 1000,
   });
 
@@ -230,6 +318,7 @@ test("resolveCollectorBinary rejects an owner-writable executable owned by anoth
       },
     }),
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 1000,
   });
 
