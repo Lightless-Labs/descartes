@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -245,13 +245,16 @@ async function runFixedCommand(command, args, options = {}) {
     ...options,
     timeout: 5000,
     maxBuffer: MAX_COMMAND_BUFFER,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
+  const provenance = binaryProvenance(result.binary);
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
     stdout: truncate(result.stdout ?? "", 4096),
     stderr: truncate(result.stderr ?? "", 2048),
+    binary_provenance: provenance,
+    command: result.command ? { ...result.command, binary_provenance: provenance } : result.command,
   };
 }
 
@@ -272,6 +275,7 @@ async function collectCommandSource(source, request, options = {}) {
     type: "command",
     status: command.status,
     command: command.command,
+    binary_provenance: command.binary_provenance,
     stderr: command.stderr,
     error: command.error,
     certificate_count: parsed.certificates.length,

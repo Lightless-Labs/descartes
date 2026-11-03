@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -42,17 +42,20 @@ async function runFixedCommand(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 5000,
     maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
   const message = result.error ?? "";
+  const provenance = binaryProvenance(result.binary);
   if (options.allowPartial && message.includes("stdout maxBuffer") && result.stdout) {
-    return { ...result, status: "ok", partial_output: true, stderr: truncate(result.stderr ?? "", 2048) };
+    return { ...result, status: "ok", partial_output: true, stderr: truncate(result.stderr ?? "", 2048), binary_provenance: provenance, command: result.command ? { ...result.command, binary_provenance: provenance } : result.command };
   }
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
     stdout: truncate(result.stdout ?? "", 4096),
     stderr: truncate(result.stderr ?? "", 2048),
+    binary_provenance: provenance,
+    command: result.command ? { ...result.command, binary_provenance: provenance } : result.command,
   };
 }
 
@@ -290,6 +293,7 @@ function probeResult({ name, source, command, entries, parsedTotal, parser, cate
     truncated: parsedTotal > entries.length,
     error: command.error ?? error,
     stderr: command.stderr ?? stderr,
+    binary_provenance: command.binary_provenance,
     partial_output: command.partial_output === true,
   };
 }

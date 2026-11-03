@@ -473,6 +473,43 @@ async function resolveTrustedLinuxTool(commands, {
   return resolved;
 }
 
+/**
+ * Report whether this Linux host has a trust-checked ACL inspection tool available. The helper
+ * chain is deliberately shared with collector-binary resolution: a merely present or PATH-visible
+ * helper is not evidence, and a non-GNU `ls` never proves ACL absence.
+ */
+export async function getLinuxAclEvidenceCapability({
+  platform = process.platform,
+  statFn = defaultStat,
+  expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined,
+  realpathFn = defaultRealpath,
+  execFileAsync = execFileAsyncDefault,
+  aclToolCache = {},
+  signal,
+} = {}) {
+  if (platform !== "linux") return "not_applicable";
+  const getfattr = await resolveTrustedLinuxTool(LINUX_XATTR_COMMANDS, {
+    kind: "getfattr",
+    statFn,
+    expectedUid,
+    realpathFn,
+    execFileAsync,
+    aclToolCache,
+    signal,
+  });
+  if (getfattr) return "verified";
+  const ls = await resolveTrustedLinuxTool(LINUX_LS_COMMANDS, {
+    kind: "ls",
+    statFn,
+    expectedUid,
+    realpathFn,
+    execFileAsync,
+    aclToolCache,
+    signal,
+  });
+  return ls ? "verified" : "unverified";
+}
+
 async function detectLinuxAclWithLs(component, {
   statFn,
   expectedUid,

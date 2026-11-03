@@ -32,7 +32,7 @@ import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { readFile as fsReadFile } from "node:fs/promises";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { alertId } from "../alert-store.js";
 import { loadLearnedConfig } from "../constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "../diagnostics-sanitizer.js";
@@ -77,9 +77,10 @@ async function runFixedExecFile(command, args, options = {}) {
     ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 512 * 1024,
-    execFileAsync,
+    execFileAsync: options.execFileAsync ?? execFileAsync,
   });
-  return { ...result, status: result.status === "ok" ? "ok" : (result.availability ?? "unable") };
+  const provenance = binaryProvenance(result.binary);
+  return { ...result, status: result.status === "ok" ? "ok" : (result.availability ?? "unable"), binary_provenance: provenance, command: result.command ? { ...result.command, binary_provenance: provenance } : result.command };
 }
 
 // ---------------------------------------------------------------------------------------------

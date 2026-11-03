@@ -189,7 +189,7 @@ test("daemon status surfaces unverified ACL evidence from collector provenance",
     disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
   };
 
-  const result = await runDaemonIteration(paths, { collectors, ts, now: ts });
+  const result = await runDaemonIteration(paths, { collectors, platform: "linux", ts, now: ts });
   assert.equal(result.status.acl_evidence, "unverified");
   assert.equal(result.status.collector_statuses[0].acl_evidence, "unverified");
   assert.equal((await readDaemonStatus(paths)).acl_evidence, "unverified");

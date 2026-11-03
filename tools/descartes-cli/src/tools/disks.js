@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -123,12 +123,11 @@ export async function collectDiskEvidence(options = {}) {
       ...options,
       timeout: 3000,
       maxBuffer: 1024 * 1024,
-      execFileAsync,
+      execFileAsync: options.execFileAsync ?? execFileAsync,
     });
-    const [space, inodes] = await Promise.all([
-      runDf(["-kP"]).then((result) => result.status === "ok" ? parseDf(result.stdout) : { status: result.availability ?? "unable", unable: result.error }),
-      runDf(["-iP"]).then((result) => result.status === "ok" ? parseDfInodes(result.stdout) : { status: result.availability ?? "unable", unable: result.error }),
-    ]);
+    const [spaceProbe, inodeProbe] = await Promise.all([runDf(["-kP"]), runDf(["-iP"])]);
+    const space = spaceProbe.status === "ok" ? parseDf(spaceProbe.stdout) : { status: spaceProbe.availability ?? "unable", unable: spaceProbe.error };
+    const inodes = inodeProbe.status === "ok" ? parseDfInodes(inodeProbe.stdout) : { status: inodeProbe.availability ?? "unable", unable: inodeProbe.error };
 
     return {
       filesystems: space,
@@ -136,7 +135,13 @@ export async function collectDiskEvidence(options = {}) {
       command: {
         argv: [["df", "-kP"], ["df", "-iP"]],
         read_only: true,
+        binary_provenance: binaryProvenance(spaceProbe.binary),
       },
+      binary_provenance: binaryProvenance(spaceProbe.binary),
+      probes: [
+        { source: "space", binary_provenance: binaryProvenance(spaceProbe.binary) },
+        { source: "inodes", binary_provenance: binaryProvenance(inodeProbe.binary) },
+      ],
     };
   }, (result) => evidenceEnvelope({
     id: "disk-usage",

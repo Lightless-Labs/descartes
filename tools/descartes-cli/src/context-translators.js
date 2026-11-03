@@ -551,9 +551,8 @@ const BINARY_WALK_MAX_DEPTH = 4;
 const BINARY_WALK_MAX_ARRAY = 64;
 const BINARY_WALK_MAX_OBSERVATIONS = 256;
 // The envelopes that report binary provenance today. Bounding the walk to them bounds the per-tick
-// record count (collector_state's T8 shape): sessions (tmux, screen), vpn-peer-status (who, last, wg,
-// scutil, lsof/ss), tailscale-status (tailscale), host-lifecycle (sysctl).
-const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle", "tmux-clients"]);
+// record count (collector_state's T8 shape): fast-tick ps plus the structural collectors.
+const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["top-processes", "process-lineage-edges", "sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle", "tmux-clients"]);
 export const MAX_BINARY_STATES_PER_TICK = 12;
 
 function binaryStateOf(provenance) {
@@ -583,7 +582,7 @@ function collectBinaryProvenance(value, depth, out) {
 
 /**
  * evidence[] -> one collector.binary_state point per closed-list binary whose resolver verdict appears
- * in this tick's structural evidence (sessions' multiplexers, the VPN/peer sources, tailscale, the
+ * in this tick's evidence (fast-tick ps, sessions' multiplexers, the VPN/peer sources, tailscale, the
  * host-lifecycle sysctl). A binary no collector reported this tick is absent (not observed), never
  * "not installed". Two disagreeing verdicts in one tick are "inconsistent", never one of them. Paths
  * and content hashes are HMAC'd; the offending component is never written.

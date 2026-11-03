@@ -109,6 +109,7 @@ import { collectHostLifecycleEvidence, readHostLifecycle } from "./tools/host-li
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
+import { getLinuxAclEvidenceCapability } from "./tools/binary-resolver.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -122,8 +123,8 @@ function hasUnverifiedAclEvidence(value, depth = 0) {
   return false;
 }
 
-function aclEvidenceStatus(envelope) {
-  return hasUnverifiedAclEvidence(envelope?.result) ? "unverified" : undefined;
+function aclEvidenceStatus(envelope, platform = process.platform) {
+  return platform === "linux" && hasUnverifiedAclEvidence(envelope?.result) ? "unverified" : undefined;
 }
 
 export const DEFAULT_DAEMON_INTERVAL_MS = 60 * 1000;
@@ -1294,9 +1295,23 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  const collectorOptions = {
+  const resolverOptions = {
+    ...(options.resolverOptions ?? {}),
+    ...(options.platform ? { platform: options.platform } : {}),
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+    aclToolCache: options.aclToolCache ?? options.resolverOptions?.aclToolCache ?? {},
   };
+  const collectorOptions = resolverOptions;
+  const aclPlatform = options.platform ?? resolverOptions.platform ?? process.platform;
+  let hostAclEvidence;
+  try {
+    hostAclEvidence = await (options.aclEvidenceCapability ?? getLinuxAclEvidenceCapability)({
+      ...resolverOptions,
+      platform: aclPlatform,
+    });
+  } catch {
+    hostAclEvidence = aclPlatform === "linux" ? "unverified" : "not_applicable";
+  }
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
   // delete quarantines older than 31 days. Fact I/O only when a tier is on (no I/O when disabled).
@@ -1483,7 +1498,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             id: envelope.id,
             status: envelope.status,
             tool: envelope.trace?.tool,
-            ...(aclEvidenceStatus(envelope) ? { acl_evidence: aclEvidenceStatus(envelope) } : {}),
+            ...(aclEvidenceStatus(envelope, aclPlatform) ? { acl_evidence: aclEvidenceStatus(envelope, aclPlatform) } : {}),
             ...(envelope.source === "daemon" && typeof envelope.result?.error === "string" ? { error: envelope.result.error } : {}),
           }));
 
@@ -1574,7 +1589,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             try {
               contextC2Prepared = await (options.prepareContextC2 ?? prepareContextC2)({
                 descartesPaths,
-                evidence: structuralEvidence,
+                evidence: [...evidence, ...structuralEvidence],
                 basePoints: factPoints,
                 hostFacts: hostContext?.facts,
                 loginDedupe,
@@ -2164,7 +2179,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       id: envelope.id,
       status: envelope.status,
       tool: envelope.trace?.tool,
-      ...(aclEvidenceStatus(envelope) ? { acl_evidence: aclEvidenceStatus(envelope) } : {}),
+      ...(aclEvidenceStatus(envelope, aclPlatform) ? { acl_evidence: aclEvidenceStatus(envelope, aclPlatform) } : {}),
     })),
     points_written: write.written_count,
     retention: write.retention,
@@ -2174,7 +2189,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(loginSeenError ? { login_seen_error: loginSeenError } : {}),
     // Context plan C2: the tick_summary/statistics outcome (data only; never part of `state`).
     ...(contextC2Status ? { context_c2: contextC2Status } : {}),
-    ...([...(evidence ?? []), ...(structuralEvidence ?? [])].some((envelope) => aclEvidenceStatus(envelope) === "unverified")
+    ...(hostAclEvidence === "unverified" || [...(evidence ?? []), ...(structuralEvidence ?? [])].some((envelope) => aclEvidenceStatus(envelope, aclPlatform) === "unverified")
       ? { acl_evidence: "unverified" }
       : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
