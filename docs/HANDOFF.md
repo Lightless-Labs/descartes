@@ -2,6 +2,25 @@
 
 **Last updated:** 2026-10-16
 
+## Linux ACL fallback and hermetic binary resolver — 2026-11-03 — local, not pushed
+
+On `fix/linux-acl-fallback-2026-11`, made binary-resolver tests hermetic and changed trust
+evaluation to complete mode-bit/ownership checks for the executable and every ancestor before
+running ACL probes, so a rejected ancestor is deterministic and cannot be masked by an earlier
+ACL subprocess. Linux ACL detection still prefers `/usr/bin/getfattr` and `/bin/getfattr`; when
+both are absent it resolves `/bin/ls` or `/usr/bin/ls`, rejects BusyBox, runs `ls -ld --` with
+`LC_ALL=C`, and treats GNU mode markers `+`, `.`, and absent as ACL present, absent, and absent
+respectively, with malformed output or command failure unknown. Added hermetic coverage for GNU
+`ls` output shapes, BusyBox, fallback trust of `/usr/bin/ps`, and the no-ACL-before-mode-rejection
+ordering.
+
+TDD commits: `29580a2` (red hermetic/fallback tests) and `f87926b` (implementation plus strict
+parser assertion). Focused resolver verification passes **41/41**. Fresh-XDG full `npm test`:
+**2,826 tests: 2,763 pass, 22 fail, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump loopback cases fail with sandbox `listen EPERM`, and 2 live
+process provenance checks return `unknown` under this macOS host's restricted/platform-specific
+process introspection. No changed-area product test failed. No push or merge.
+
 ## C1 due-notice drain phasing and route circuit — 2026-10-16 — local, not pushed
 
 Moved retained due-notice draining to the end of the daemon tick, after collection, detection,
